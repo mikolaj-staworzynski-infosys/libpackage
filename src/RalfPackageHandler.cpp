@@ -26,6 +26,7 @@
 #include <json/json.h>
 #include <fstream>
 
+#include <algorithm>
 #include <cstdint>
 
 #include <pwd.h> //For getting user id and group id of ralf user
@@ -300,6 +301,13 @@ namespace packagemanager
                 << "[libPackage] Error uninstalling package: " << e.what() << std::endl;
             return Result::FAILED;
         }
+        // Drop the package (all versions) from the in-memory registry, so that dependency
+        // resolution no longer resolves to files that do not exist anymore
+        mInstalledPackages.erase(
+            std::remove_if(mInstalledPackages.begin(), mInstalledPackages.end(),
+                           [&packageId](const std::unique_ptr<ConfigMetadataKey> &entry)
+                           { return entry->first == packageId; }),
+            mInstalledPackages.end());
         return Result::SUCCESS;
     }
 
