@@ -85,6 +85,11 @@ namespace packagemanager
          * (signature and structure) before anything is written, staged under a temporary
          * name and atomically renamed into place as package.ralf.
          *
+         * When fileLocator already points at the staged marker (package.ralf.install) in
+         * the target <packageId>/<version> directory - the upgrade procedure's commit
+         * path - the file is not copied at all, only renamed into place; a leftover
+         * package.ralf.tmp staging file in that directory is removed.
+         *
          * Recognized additionalMetadata keys:
          * - "COMMIT_INSTALL_SKIP_DEPENDENCY_CHECK" = "true": install without the dependency
          *   check. Control flag of the safe upgrade procedure's commit path - the commit

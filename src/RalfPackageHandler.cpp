@@ -432,22 +432,42 @@ namespace packagemanager
         // live mount.
         auto destRalfPackagePath = packagePath / RalfPackage;
         auto tempRalfPackagePath = packagePath / (std::string(RalfPackage) + ".tmp");
+        auto stagedPackagePath = packagePath / RalfPackageInstallMarker;
         try
         {
-            std::filesystem::copy_file(fileLocator, tempRalfPackagePath, std::filesystem::copy_options::overwrite_existing);
-            if (std::filesystem::exists(destRalfPackagePath))
+            if (std::filesystem::path(fileLocator).lexically_normal() == stagedPackagePath.lexically_normal())
             {
-                // Swapping an existing installation: keep the original file permissions
-                std::filesystem::permissions(tempRalfPackagePath, std::filesystem::status(destRalfPackagePath).permissions());
+                // Staged install from the upgrade procedure: the package was already
+                // placed here (and synced) by the prepare phase and is verified above, so
+                // just rename it into place - no extra copy. A leftover staging file from
+                // an interrupted plain install is dropped.
+                std::error_code errorCode;
+                std::filesystem::remove(tempRalfPackagePath, errorCode);
+                if (std::filesystem::exists(destRalfPackagePath))
+                {
+                    // Swapping an existing installation: keep the original file permissions
+                    std::filesystem::permissions(stagedPackagePath, std::filesystem::status(destRalfPackagePath).permissions());
+                }
+                std::filesystem::rename(stagedPackagePath, destRalfPackagePath);
+                syncFile(packagePath); // Flush the directory entries so the rename is durable
             }
-            if (!syncFile(tempRalfPackagePath))
+            else
             {
-                std::cerr << "[libPackage] Failed to sync package file to disk: " << tempRalfPackagePath << std::endl;
-                std::filesystem::remove(tempRalfPackagePath);
-                return Result::FAILED;
+                std::filesystem::copy_file(fileLocator, tempRalfPackagePath, std::filesystem::copy_options::overwrite_existing);
+                if (std::filesystem::exists(destRalfPackagePath))
+                {
+                    // Swapping an existing installation: keep the original file permissions
+                    std::filesystem::permissions(tempRalfPackagePath, std::filesystem::status(destRalfPackagePath).permissions());
+                }
+                if (!syncFile(tempRalfPackagePath))
+                {
+                    std::cerr << "[libPackage] Failed to sync package file to disk: " << tempRalfPackagePath << std::endl;
+                    std::filesystem::remove(tempRalfPackagePath);
+                    return Result::FAILED;
+                }
+                std::filesystem::rename(tempRalfPackagePath, destRalfPackagePath);
+                syncFile(packagePath); // Flush the directory entry so the rename is durable
             }
-            std::filesystem::rename(tempRalfPackagePath, destRalfPackagePath);
-            syncFile(packagePath); // Flush the directory entry so the rename is durable
 
             auto appPath = destRalfPackagePath.string();
             configMetadata.appPath = std::move(appPath);
