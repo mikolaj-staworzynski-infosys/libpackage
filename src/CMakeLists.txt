@@ -20,9 +20,14 @@ find_package(libralf REQUIRED)
 include(GNUInstallDirs)
 
 set (PACKAGE_SRCS RalfPackageHandler.cpp)
-
+set (LIB_VER 2.0.1)
 add_library(Package SHARED ${PACKAGE_SRCS})
-set_target_properties(Package PROPERTIES VERSION 2.0.0 SOVERSION 1)
+if(DEFINED BUILD_VER)
+    message(STATUS "Using build version: ${BUILD_VER}")
+    set_target_properties(Package PROPERTIES VERSION ${BUILD_VER} SOVERSION 1)
+else()
+    set_target_properties(Package PROPERTIES VERSION ${LIB_VER} SOVERSION 1)
+endif()
 
 if(DISABLE_DEPENDENCY_CHECK)
     message(STATUS "Dependency check is disabled")

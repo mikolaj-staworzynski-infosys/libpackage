@@ -67,7 +67,6 @@ namespace packagemanager
     {
     private:
         static int getInstalledPackages(std::vector<std::string> &pacakgeList);
-        static void getPackageIdAndVersionFromRalfPackage(const std::string &packagePath, std::string &appId, std::string &appVersion);
         static bool enableDependencyCheck;
 
     public:
@@ -85,6 +84,8 @@ namespace packagemanager
 
         Result GetInstalledPackageMetadata(const std::string &packageId, const std::string &version, std::string &config) override;
 
+        Result GetConfigListForInstalledPackages(const std::string &filter, std::string &config ) override;
+
     private:
         // Flag to check initialisation status
         bool mIsInitialized = false;
@@ -101,7 +102,8 @@ namespace packagemanager
         // For package verification
         ralf::VerificationBundle mVerificationBundle;
 
-        std::vector<std::unique_ptr<ConfigMetadataKey> > mInstalledPackages;
+        std::vector<std::shared_ptr<ConfigMetadataKey> > mInstalledPackages;
+        std::vector<std::shared_ptr<ConfigMetadataKey> > mDialPackages;
 
         /**
          * This function checks the dependencies of the given package and returns true if all dependencies are
@@ -184,8 +186,16 @@ namespace packagemanager
         /**
          * Adds the permissions from the package metadata to the configuration metadata.
          * @param pkgMetadata The package metadata whose permissions are to be added.
-         * @param configMetadata The configuration metadata to which the permissions will be added.
+         * @param appInfo The application info from which the permissions will be added to the configuration metadata.
          */
-        void addPackagePermissionsToConfigMetadata(const ralf::PackageMetaData &pkgMetadata, ConfigMetaData &configMetadata);
+        void addPackagePermissionsToConfigMetadata(const ralf::ApplicationInfo &appInfo, ConfigMetaData &configMetadata);
+
+        /**
+         * Extracts metadata from the given package and populates the provided configuration metadata structure.
+         * @param package The package from which metadata is to be extracted.
+         * @param configMetadata The configuration metadata structure to be populated.
+         * @return true if metadata extraction is successful; false otherwise.
+         */
+        bool extractMetadataFromPackage(const ralf::Package &package,ConfigMetaData &configMetadata);
     };
 }
