@@ -42,6 +42,17 @@ namespace
     static constexpr const char *pkgCertDirPath = RDK_PACKAGE_CERT_PATH;
     static constexpr const char *BuildReference = BUILD_REFERENCE;
 
+    // Safe upgrade procedure markers (created/removed by the component above, e.g. the
+    // PackageManager plugin or CatalogInstaller). Layout, relative to AppInstallationPath:
+    //   ./<packageId>/<version>/package.ralf.install - staged package, invisible until renamed to package.ralf
+    //   ./<packageId>/<version>/package.ralf.remove  - empty marker: remove this version on commit
+    //   ./STATE.prepare                              - prepare phase ongoing; present at boot = roll back
+    //   ./STATE.commit                               - commit pending; present at boot = finish it
+    static constexpr const char *RalfPackageInstallMarker = "package.ralf.install";
+    static constexpr const char *RalfPackageRemoveMarker = "package.ralf.remove";
+    static constexpr const char *StatePrepareFile = "STATE.prepare";
+    static constexpr const char *StateCommitFile = "STATE.commit";
+
     // Flushes a file's (or directory's) data and metadata to disk. Used to make the
     // staged package file durable before atomically renaming it into place.
     static bool syncFile(const std::filesystem::path &path)
@@ -154,6 +165,13 @@ namespace packagemanager
         }
         else
         {
+            // Recover from an interrupted prepare phase of the upgrade procedure before
+            // scanning, so the scan below sees the final package set. An interrupted commit
+            // (STATE.commit present) is intentionally left untouched here - it is finished
+            // by the component above; the staged markers are invisible to the scan anyway
+            // (only package.ralf is picked up).
+            cleanupPreparedChanges();
+
             std::vector<std::string> installedPackages;
             // Let us get package metadata of all installed packages
             auto count = getInstalledPackages(installedPackages);
@@ -215,6 +233,162 @@ namespace packagemanager
             }
         }
         return certLoaded;
+    }
+
+    void RalfPackageImpl::cleanupPreparedChanges()
+    {
+        // Rollback sequence of the safe upgrade procedure, run at startup before the
+        // installed packages are scanned. Condition: STATE.prepare exists, meaning the
+        // prepare phase did not finish and everything staged in the background has to be
+        // removed from the flash filesystem:
+        //   (1) remove all package.ralf.remove markers found in all subdirectories
+        //   (2) remove all package.ralf.install files and the (now empty) id/version dirs
+        //   (3) remove STATE.prepare itself
+        // STATE.prepare is removed only as the last step, so if a power outage interrupts
+        // this sequence, the next boot simply repeats it with fewer files left.
+        namespace fs = std::filesystem;
+        const fs::path installPath(AppInstallationPath);
+        std::error_code errorCode;
+
+        const fs::path prepareMarker = installPath / StatePrepareFile;
+        if (!fs::exists(prepareMarker, errorCode))
+        {
+            if (fs::exists(installPath / StateCommitFile, errorCode))
+            {
+                // Not ours to finish here: committing means real installs/removals with
+                // dependency ordering and bookkeeping by the component above. The staged
+                // markers are invisible to the package scan (only package.ralf is picked
+                // up), so leaving them in place is harmless.
+                std::cout << "[libPackage] Found " << StateCommitFile
+                          << " - interrupted commit phase, leaving staged changes to be applied" << std::endl;
+            }
+            return;
+        }
+
+        std::cout << "[libPackage] Found " << StatePrepareFile
+                  << " - interrupted prepare phase, rolling back staged changes" << std::endl;
+
+        // Collect all staged markers first, so that removals never disturb the iteration
+        std::vector<fs::path> installMarkers, removeMarkers;
+        fs::recursive_directory_iterator it(installPath, fs::directory_options::skip_permission_denied, errorCode);
+        fs::recursive_directory_iterator end;
+        for (; !errorCode && it != end; it.increment(errorCode))
+        {
+            if (!it->is_regular_file(errorCode))
+            {
+                continue;
+            }
+            const auto filename = it->path().filename();
+            if (filename == RalfPackageInstallMarker)
+            {
+                installMarkers.push_back(it->path());
+            }
+            else if (filename == RalfPackageRemoveMarker)
+            {
+                removeMarkers.push_back(it->path());
+            }
+        }
+
+        // (1) + (2). Every directory that lost an entry has to be fsynced, otherwise
+        // a power outage can resurrect an already "removed" marker while STATE.prepare
+        // is already gone - and the rollback would never run again.
+        bool removalFailed = false;
+        std::set<fs::path> dirsToSync;
+        for (const auto &marker : removeMarkers)
+        {
+            std::cout << "[libPackage] Rolling back staged remove marker: " << marker << std::endl;
+            fs::remove(marker, errorCode);
+            if (errorCode)
+            {
+                std::cerr << "[libPackage] Failed to remove " << marker << ": " << errorCode.message() << std::endl;
+                removalFailed = true;
+                errorCode.clear();
+            }
+            else
+            {
+                dirsToSync.insert(marker.parent_path());
+            }
+        }
+        for (const auto &marker : installMarkers)
+        {
+            std::cout << "[libPackage] Rolling back staged package file: " << marker << std::endl;
+            fs::remove(marker, errorCode);
+            if (errorCode)
+            {
+                std::cerr << "[libPackage] Failed to remove " << marker << ": " << errorCode.message() << std::endl;
+                removalFailed = true;
+                errorCode.clear();
+            }
+            else
+            {
+                dirsToSync.insert(marker.parent_path());
+            }
+        }
+        // Make the marker removals durable (bottom-up: version dirs first)
+        for (const auto &dir : dirsToSync)
+        {
+            syncFile(dir);
+        }
+
+        // Remove the (now empty) <id>/<version> directories created during the prepare
+        // phase, fsyncing each parent after its child is gone
+        for (const auto &idEntry : fs::directory_iterator(installPath, fs::directory_options::skip_permission_denied, errorCode))
+        {
+            if (!idEntry.is_directory())
+            {
+                continue;
+            }
+            bool versionDirRemoved = false;
+            for (const auto &verEntry : fs::directory_iterator(idEntry.path(), fs::directory_options::skip_permission_denied, errorCode))
+            {
+                if (verEntry.is_directory() && fs::is_empty(verEntry.path(), errorCode))
+                {
+                    fs::remove(verEntry.path(), errorCode);
+                    if (errorCode)
+                    {
+                        std::cerr << "[libPackage] Failed to remove " << verEntry.path() << ": " << errorCode.message() << std::endl;
+                        removalFailed = true;
+                        errorCode.clear();
+                    }
+                    else
+                    {
+                        versionDirRemoved = true;
+                    }
+                }
+            }
+            if (versionDirRemoved)
+            {
+                syncFile(idEntry.path());
+            }
+            if (fs::is_empty(idEntry.path(), errorCode))
+            {
+                fs::remove(idEntry.path(), errorCode);
+                if (errorCode)
+                {
+                    std::cerr << "[libPackage] Failed to remove " << idEntry.path() << ": " << errorCode.message() << std::endl;
+                    removalFailed = true;
+                    errorCode.clear();
+                }
+                else
+                {
+                    syncFile(installPath);
+                }
+            }
+        }
+
+        // (3) STATE.prepare is removed only when everything staged is really gone - it is
+        // the trigger for this rollback, so a failure above must leave it in place for the
+        // next boot to retry
+        if (!removalFailed)
+        {
+            fs::remove(prepareMarker, errorCode);
+            if (errorCode)
+            {
+                std::cerr << "[libPackage] Failed to remove " << prepareMarker << ": " << errorCode.message() << std::endl;
+                errorCode.clear();
+            }
+        }
+        syncFile(installPath);
     }
 
     Result RalfPackageImpl::Install(const std::string &packageId, const std::string &version, const NameValues &additionalMetadata, const std::string &fileLocator, ConfigMetaData &configMetadata)

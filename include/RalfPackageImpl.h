@@ -136,6 +136,16 @@ namespace packagemanager
         bool initializeVerificationBundle();
 
         /**
+         * Rolls back the staged files of an interrupted prepare phase of the safe upgrade
+         * procedure (see the marker constants in the source file). Called from Initialize,
+         * before the installed packages are scanned. Runs only when STATE.prepare is present;
+         * an interrupted commit (STATE.commit present) is left for the component above to
+         * finish. Idempotent: a power outage during the rollback itself just means the next
+         * boot repeats it with fewer files left.
+         */
+        void cleanupPreparedChanges();
+
+        /**
          * Opens a package file and returns a Result containing the Package object.
          * Optionally performs full package verification.
          * @param packageFile The path to the package file.
