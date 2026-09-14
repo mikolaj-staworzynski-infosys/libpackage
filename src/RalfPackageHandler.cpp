@@ -20,6 +20,7 @@
 #include "RalfPackageImpl.h"
 #include <iostream>
 #include <filesystem>
+#include <set>
 #include <ralf/PackageMount.h>
 #include <ralf/PackageMetaData.h>
 #include <ralf/VersionNumber.h>
@@ -66,6 +67,9 @@ namespace packagemanager
     RalfPackageImpl::RalfPackageImpl()
     {
         std::cout << "[libPackage] Code revision : " << BuildReference << std::endl;
+#ifdef RALF_PACKAGE_SELF_TEST
+        runGetApplicationsToRestartSelfTest();
+#endif
     }
     int RalfPackageImpl::getInstalledPackages(std::vector<std::string> &pacakgeList)
     {
@@ -415,6 +419,101 @@ namespace packagemanager
         bool unmountResult = unlockPackage(packageId + "_" + version);
 
         return unmountResult ? Result::SUCCESS : Result::FAILED;
+    }
+
+    Result RalfPackageImpl::GetApplicationsToRestart(const std::string &packageId, std::vector<std::string> &applicationIds)
+    {
+        if (!mIsInitialized)
+        {
+            std::cerr << "[libPackage] RalfPackageImpl::GetApplicationsToRestart called before initialization." << std::endl;
+            return Result::FAILED;
+        }
+        findApplicationsToRestart(packageId, mMountedPackages, applicationIds);
+        std::cout << "[libPackage] GetApplicationsToRestart for packageId: " << packageId
+                  << " -> " << applicationIds.size() << " application(s) to restart" << std::endl;
+        return Result::SUCCESS;
+    }
+
+    void RalfPackageImpl::findApplicationsToRestart(const std::string &packageId,
+                                                    const std::map<std::string, std::unique_ptr<MountedPackageInfo> > &mountedPackages,
+                                                    std::vector<std::string> &applicationIds)
+    {
+
+        // Example trace. Mounted lock chains (keys are "id_version"):
+        //   Application1_1.0      => com.rdkcentral.wpe_3.0 => com.rdkcentral.base_1.0
+        //   Application2_2.0      => com.rdkcentral.wpe_3.0 => com.rdkcentral.base_1.0
+        // A new version of com.rdkcentral.wpe was just installed, so the service calls
+        // GetApplicationsToRestart("com.rdkcentral.wpe").
+        //
+        // 1) After building the reverse lock graph (dependency -> dependents):
+        //      dependents = {
+        //          "com.rdkcentral.wpe_3.0":  [ "Application1_1.0", "Application2_2.0" ],
+        //          "com.rdkcentral.base_1.0": [ "com.rdkcentral.wpe_3.0" ]
+        //      }
+        //
+        // 2) After seeding with the mounted versions of the package (note: the MOUNTED
+        //    version 3.0, not the just-installed one, which is not locked by anyone yet):
+        //      pending = [ "com.rdkcentral.wpe_3.0" ]
+        //
+        // 3) After the BFS upwards through all dependents:
+        //      affected = { "com.rdkcentral.wpe_3.0", "Application1_1.0", "Application2_2.0" }
+        //    (com.rdkcentral.base is NOT affected: it does not depend on wpe, wpe depends on it)
+        //
+        // 4) After filtering to roots (affected packages that nothing else depends on)
+        //    and stripping the versions:
+        //      "com.rdkcentral.wpe_3.0" has dependents        -> skipped (it is a library;
+        //                                                        restarting the apps below
+        //                                                        refreshes it anyway)
+        //      "Application1_1.0", "Application2_2.0"         -> roots
+        //      applicationIds = [ "Application1", "Application2" ]
+        std::map<std::string, std::vector<std::string> > dependents;
+        for (const auto &entry : mountedPackages)
+        {
+            for (const auto &dep : entry.second->dependencies)
+            {
+                dependents[dep].push_back(entry.first);
+            }
+        }
+
+        // Walk upwards from every mounted version of the package (running instances are
+        // typically on an older version than the one just installed) and collect the
+        // whole affected subgraph
+        std::set<std::string> affected;
+        std::vector<std::string> pending;
+        for (const auto &entry : mountedPackages)
+        {
+            if (entry.first.compare(0, packageId.size() + 1, packageId + "_") == 0)
+            {
+                pending.push_back(entry.first);
+            }
+        }
+        while (!pending.empty())
+        {
+            const std::string key = pending.back();
+            pending.pop_back();
+            if (!affected.insert(key).second)
+            {
+                continue;
+            }
+            const auto it = dependents.find(key);
+            if (it != dependents.end())
+            {
+                pending.insert(pending.end(), it->second.begin(), it->second.end());
+            }
+        }
+
+        // Return the roots of the affected subgraph: locked packages that nothing else
+        // depends on. Those are the applications; restarting them refreshes the whole
+        // dependency chain, so intermediate libraries are not reported.
+        std::set<std::string> appIds;
+        for (const auto &key : affected)
+        {
+            if (dependents.find(key) == dependents.end())
+            {
+                appIds.insert(key.substr(0, key.rfind('_')));
+            }
+        }
+        applicationIds.assign(appIds.begin(), appIds.end());
     }
 
     Result RalfPackageImpl::GetFileMetadata(const std::string &fileLocator, std::string &packageId, std::string &version, ConfigMetaData &configMetadata)

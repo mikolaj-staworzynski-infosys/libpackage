@@ -88,6 +88,17 @@ namespace packagemanager
         Result GetFileMetadata(const std::string &fileLocator, std::string &packageId, std::string &version, ConfigMetaData &configMetadata) override;
         Result VerifyPackage(const std::string &fileLocator) override;
 
+        /**
+         * Returns the ids of currently locked applications that must be restarted because they
+         * are the given package or depend on it, directly or transitively.
+         *
+         * The package is matched by id only, deliberately without a version: running instances
+         * are locked on the version that was installed at Lock time, which is typically older
+         * than the version just installed. Matching on the new version would find nothing,
+         * since that version is not mounted (locked) yet.
+         */
+        Result GetApplicationsToRestart(const std::string &packageId, std::vector<std::string> &applicationIds) override;
+
     private:
         // Flag to check initialisation status
         bool mIsInitialized = false;
@@ -153,6 +164,25 @@ namespace packagemanager
          * @return true if the package and all its dependents were unlocked successfully; false otherwise.
          */
         bool unlockPackage(const std::string &pkgVerKey);
+
+        /**
+         * Core of GetApplicationsToRestart, operating on a given mount table instead of the
+         * member one, so it can be exercised with synthetic dependency chains (self test).
+         * Returns the ids of the locked applications (roots of the lock graph) that are the
+         * given package or depend on it, directly or transitively.
+         */
+        static void findApplicationsToRestart(const std::string &packageId,
+                                              const std::map<std::string, std::unique_ptr<MountedPackageInfo> > &mountedPackages,
+                                              std::vector<std::string> &applicationIds);
+
+#ifdef RALF_PACKAGE_SELF_TEST
+        /**
+         * Runs synthetic dependency-chain test cases through findApplicationsToRestart and
+         * logs PASS/FAIL for each. Purely in-memory: no real packages or mounts are touched,
+         * so it is safe to run on hardware.
+         */
+        static void runGetApplicationsToRestartSelfTest();
+#endif
 
         /**
          * Identifies the installed version of a dependent package that satisfies the given version constraint.

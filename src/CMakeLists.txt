@@ -31,6 +31,12 @@ else()
     message(STATUS "Dependency check is enabled")
 endif()
 
+if(RALF_PACKAGE_SELF_TEST)
+    message(STATUS "Self test cases are enabled")
+    target_compile_definitions(Package PRIVATE RALF_PACKAGE_SELF_TEST)
+    target_sources(Package PRIVATE RalfPackageSelfTest.cpp)
+endif()
+
 if(DEFINED RDK_PACKAGE_CERT_PATH AND NOT RDK_PACKAGE_CERT_PATH STREQUAL "")
     message(STATUS "Using custom package certificate path: ${RDK_PACKAGE_CERT_PATH}")
     target_compile_definitions(Package PRIVATE RDK_PACKAGE_CERT_PATH="${RDK_PACKAGE_CERT_PATH}")
