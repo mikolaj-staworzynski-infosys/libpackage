@@ -407,7 +407,14 @@ namespace packagemanager
         }
         std::cout << "[libPackage] Successfully opened package: " << fileLocator << std::endl;
 
-        if (enableDependencyCheck)
+        // Control flag for the commit path of the safe upgrade procedure: the commit applies
+        // staged markers in scan order, which cannot be dependency-ordered, and the set was
+        // already validated when the commit plan was built - so the per-package dependency
+        // check is skipped for those installs.
+        bool skipDependencyCheck = std::any_of(additionalMetadata.begin(), additionalMetadata.end(),
+                                               [](const NameValue &nv)
+                                               { return nv.first == "COMMIT_INSTALL_SKIP_DEPENDENCY_CHECK" && nv.second == "true"; });
+        if (enableDependencyCheck && !skipDependencyCheck)
         {
             if (!checkPackageDependencies(package.value()))
                 return Result::FAILED;

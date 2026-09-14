@@ -80,6 +80,18 @@ namespace packagemanager
 
         Result Initialize(const std::string &configStr, ConfigMetadataArray &aConfigMetadata) override;
 
+        /**
+         * Installs the package from the given file. The package is fully verified
+         * (signature and structure) before anything is written, staged under a temporary
+         * name and atomically renamed into place as package.ralf.
+         *
+         * Recognized additionalMetadata keys:
+         * - "COMMIT_INSTALL_SKIP_DEPENDENCY_CHECK" = "true": install without the dependency
+         *   check. Control flag of the safe upgrade procedure's commit path - the commit
+         *   applies staged markers in scan order, which cannot be dependency-ordered, and
+         *   the package set was already validated when the commit plan was built. Not meant
+         *   for regular installs.
+         */
         Result Install(const std::string &packageId, const std::string &version, const NameValues &additionalMetadata, const std::string &fileLocator, ConfigMetaData &configMetadata) override;
         Result Uninstall(const std::string &packageId) override;
 
