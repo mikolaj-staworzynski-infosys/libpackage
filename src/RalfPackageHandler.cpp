@@ -443,6 +443,24 @@ namespace packagemanager
         return Result::SUCCESS;
     }
 
+    Result RalfPackageImpl::VerifyPackage(const std::string &fileLocator)
+    {
+        if (!mIsInitialized)
+        {
+            std::cerr << "[libPackage] RalfPackageImpl::VerifyPackage called before initialization." << std::endl;
+            return Result::FAILED;
+        }
+        std::cout << "[libPackage] RalfPackageImpl::VerifyPackage called with fileLocator: " << fileLocator << std::endl;
+
+        auto package = openPackage(fileLocator, true);
+        if (!package)
+        {
+            std::cerr << "[libPackage] Package verification failed: " << fileLocator << std::endl;
+            return Result::VERIFICATION_FAILURE;
+        }
+        return Result::SUCCESS;
+    }
+
     bool RalfPackageImpl::lockPackage(const ralf::Package &package, std::vector<RalfPackageInfo> &ralfMountInfo, ConfigMetaData &configMetadata)
     {
         bool status = false;
