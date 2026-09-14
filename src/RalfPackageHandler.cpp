@@ -364,14 +364,13 @@ namespace packagemanager
             std::cerr << "[libPackage] RalfPackageImpl::Unlock called before initialization." << std::endl;
             return Result::FAILED;
         }
-        auto packagePath = std::filesystem::path(AppInstallationPath) / packageId / version / RalfPackage;
-        auto package = openPackage(packagePath);
-        if (!package)
-        {
-            std::cerr << "[libPackage] Failed to open package for unlocking: " << packagePath.string() << std::endl;
-            return Result::FAILED;
-        }
-        return unmountDependentPackages(package.value()) ? Result::SUCCESS : Result::FAILED;
+        std::cout << "[libPackage] RalfPackageImpl::Unlock called with packageId: " << packageId << ", version: " << version << std::endl;
+
+        // The dependency tree resolved at Lock time is stored in mMountedPackages, so there is
+        // no need to re-open (and re-verify) the package file to release the lock.
+        bool unmountResult = unlockPackage(packageId + "_" + version);
+
+        return unmountResult ? Result::SUCCESS : Result::FAILED;
     }
 
     Result RalfPackageImpl::GetFileMetadata(const std::string &fileLocator, std::string &packageId, std::string &version, ConfigMetaData &configMetadata)
@@ -422,6 +421,9 @@ namespace packagemanager
         }
 
         status = true;
+        // Keys of the dependent packages locked by this call. Used for rollback on failure and
+        // stored in the mount table on success, so Unlock can release them without re-opening files.
+        std::vector<std::string> lockedDependencies;
         // Let us process dependencies first
         auto dependencies = pkgMetadata->dependencies();
         for (const auto &dependency : dependencies)
@@ -452,10 +454,14 @@ namespace packagemanager
                 status = false;
                 break;
             }
+            lockedDependencies.push_back(depPackageId + "_" + depInstalledVersion);
         }
         if (!status)
         {
-            unmountDependentPackages(package);
+            for (const auto &depKey : lockedDependencies)
+            {
+                unlockPackage(depKey);
+            }
             return false;
         }
         // Let us get permissions. from package.
@@ -481,7 +487,10 @@ namespace packagemanager
         if (!verifyResult)
         {
             std::cerr << "[libPackage] Failed to verify package: " << package.id() << " Error: " << verifyResult.error().what() << std::endl;
-            unmountDependentPackages(package);
+            for (const auto &depKey : lockedDependencies)
+            {
+                unlockPackage(depKey);
+            }
             return false;
         }
 
@@ -493,11 +502,24 @@ namespace packagemanager
         if (!mountResult)
         {
             std::cerr << "[libPackage][RALFMOUNT] Failed to mount dependent package: " << packageId << mountResult.error().what() << std::endl;
-            unmountDependentPackages(package);
+            for (const auto &depKey : lockedDependencies)
+            {
+                unlockPackage(depKey);
+            }
             return false;
         }
 
         std::unique_ptr<MountedPackageInfo> mountInfo = std::make_unique<MountedPackageInfo>();
+        mountInfo->dependencies = lockedDependencies;
+
+        // Note: only the direct dependencies of this package are stored/printed here.
+        // Each dependency's own entry in the mount table holds its own direct dependencies,
+        // so the full tree is covered when walking recursively (e.g. in unlockPackage).
+        std::cout << "[libPackage] Mounted package: " << pkgVerKey << " with " << lockedDependencies.size() << " resolved dependencies:" << std::endl;
+        for (const auto &depKey : lockedDependencies)
+        {
+            std::cout << "[libPackage]   -> " << depKey << std::endl;
+        }
 
         auto configPath = std::filesystem::path(RDK_PACKAGE_MOUNT_PATH) / pkgVerKey / RDK_PACKAGE_CONFIG;
         if (dumpPackageInfo(package, configPath))
@@ -562,64 +584,51 @@ namespace packagemanager
         return package;
     }
 
-    bool RalfPackageImpl::unmountDependentPackages(const ralf::Package &package)
+    bool RalfPackageImpl::unlockPackage(const std::string &pkgVerKey)
     {
-        auto pkgMetadata = package.metaData();
-        if (!pkgMetadata)
-        {
-            std::cerr << "[libPackage] Failed to read package metadata for unlocking dependencies: " << pkgMetadata.error().what() << std::endl;
-            return false;
-        }
-
-        auto dependencies = pkgMetadata->dependencies();
-        for (const auto &dependency : dependencies)
-        {
-            std::string depPackageId = dependency.first;
-            ralf::VersionConstraint depPkgVersion = dependency.second;
-            std::string depInstalledVersion;
-
-            if (identifyDependencyVersion(depPackageId, depPkgVersion, depInstalledVersion))
-            {
-                auto fileLocator = std::filesystem::path(AppInstallationPath) / depPackageId / depInstalledVersion / RalfPackage;
-                auto depPackage = openPackage(fileLocator);
-                if (depPackage)
-                {
-                    if (!unmountDependentPackages(depPackage.value()))
-                    {
-                        std::cerr << "[libPackage] Failed to unmount dependent packages for package: " << depPackageId << ", version " << depInstalledVersion << std::endl;
-                        // TODO revisit this logic
-                        // return false;
-                    }
-                }
-            }
-            else
-            {
-                std::cerr << "[libPackage] Failed to idenitfy the version of dependency " << depPackageId << ", version " << depPkgVersion.toString() << std::endl;
-            }
-        }
-        std::string depPackageKey = package.id() + "_" + package.version().toString();
-
-        auto it = mMountedPackages.find(depPackageKey);
+        auto it = mMountedPackages.find(pkgVerKey);
         if (it == mMountedPackages.end())
         {
-            std::cerr << "[libPackage] Package not found in mounted packages: " << depPackageKey << std::endl;
+            std::cerr << "[libPackage] Package not found in mounted packages: " << pkgVerKey << std::endl;
             return false;
         }
 
-        if (it->second->packageMount->isMounted() == false)
+        bool status = true;
+        for (const auto &depKey : it->second->dependencies)
         {
-            std::cerr << "[libPackage] Package is not mounted: " << depPackageKey << std::endl;
-            return false;
+            if (!unlockPackage(depKey))
+            {
+                std::cerr << "[libPackage] Failed to unlock dependent package: " << depKey << std::endl;
+                // Keep unlocking the remaining dependencies even if one fails
+                status = false;
+            }
         }
+
         it->second->decMountCount();
         if (it->second->mountCount == 0)
         {
             // Need to unmount the package
             it->second->packageMount->unmount();
+
+            // Clean up mount directories
+            auto mountBasePath = std::filesystem::path(RDK_PACKAGE_MOUNT_PATH) / pkgVerKey;
+            try
+            {
+                if (std::filesystem::exists(mountBasePath))
+                {
+                    std::filesystem::remove_all(mountBasePath);
+                    std::cout << "[libPackage] Removed mount directory: " << mountBasePath << std::endl;
+                }
+            }
+            catch (const std::filesystem::filesystem_error &e)
+            {
+                std::cerr << "[libPackage] Error removing mount directory " << mountBasePath << ": " << e.what() << std::endl;
+            }
+
             mMountedPackages.erase(it);
         }
 
-        return true;
+        return status;
     }
 
     bool RalfPackageImpl::dumpPackageInfo(const ralf::Package &package, const std::filesystem::path &configPath)

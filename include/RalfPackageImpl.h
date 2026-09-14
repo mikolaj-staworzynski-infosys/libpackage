@@ -52,6 +52,10 @@ namespace packagemanager
         // We need this to keep track of how many times a package is mounted. Otherwise we will unmount it too early
         int mountCount = 1;
         std::string pkgJsonPath;
+        // Resolved "id_version" keys of the direct (one level down) dependencies locked together with
+        // this package. Recorded at lock time so that unlock does not need to re-open the package file.
+        // Deeper levels of the tree are stored in the entries of the dependencies themselves.
+        std::vector<std::string> dependencies;
         std::unique_ptr<ralf::PackageMount> packageMount;
         void incMountCount() { mountCount++; }
         void decMountCount() { mountCount--; }
@@ -140,11 +144,14 @@ namespace packagemanager
         bool lockPackage(const ralf::Package &package, std::vector<RalfPackageInfo> &ralfMountInfo, ConfigMetaData &configMetadata);
 
         /**
-         * Unmounts the dependent packages mounted by the specified package.
-         * @param package The package whose dependencies are to be unmounted.
-         * @return true if all dependent packages are unmounted successfully; false otherwise.
+         * Releases a lock on the package identified by the given key. Decrements the mount count of the
+         * package and, recursively, of the dependent packages recorded at lock time, unmounting any
+         * package whose count reaches zero and removing its mount directory. Operates purely on the
+         * in-memory mount table.
+         * @param pkgVerKey The "id_version" key of the package to unlock.
+         * @return true if the package and all its dependents were unlocked successfully; false otherwise.
          */
-        bool unmountDependentPackages(const ralf::Package &package);
+        bool unlockPackage(const std::string &pkgVerKey);
 
         /**
          * Identifies the installed version of a dependent package that satisfies the given version constraint.
