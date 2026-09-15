@@ -560,6 +560,52 @@ namespace packagemanager
         return Result::SUCCESS;
     }
 
+    Result RalfPackageImpl::Uninstall(const std::string &packageId, const std::string &version)
+    {
+        if (!mIsInitialized)
+        {
+            std::cerr << "[libPackage] RalfPackageImpl::Uninstall called before initialization." << std::endl;
+            return Result::FAILED;
+        }
+        std::cout << "[libPackage] RalfPackageImpl::Uninstall called with packageId: " << packageId << ", version: " << version << std::endl;
+
+        // A version that is currently locked/mounted is removed anyway: running instances
+        // keep using the old image via their loop device until the last Unlock
+        const std::string pkgVerKey = packageId + "_" + version;
+        const auto mounted = mMountedPackages.find(pkgVerKey);
+        if (mounted != mMountedPackages.end())
+        {
+            std::cout << "[libPackage] Warning: uninstalling version that is currently locked/mounted: " << pkgVerKey
+                      << " (mount count: " << mounted->second->mountCount << ")" << std::endl;
+        }
+
+        const auto versionPath = std::filesystem::path(AppInstallationPath) / packageId / version;
+        const auto packagePath = std::filesystem::path(AppInstallationPath) / packageId;
+        std::error_code errorCode;
+        std::filesystem::remove_all(versionPath, errorCode);
+        if (errorCode)
+        {
+            std::cerr << "[libPackage] Error uninstalling package: " << packageId << ", version: " << version
+                      << " - " << errorCode.message() << std::endl;
+            return Result::FAILED;
+        }
+        syncFile(packagePath); // make the version directory removal durable
+        // Drop the package directory as well when this was the last version
+        if (std::filesystem::is_empty(packagePath, errorCode))
+        {
+            std::filesystem::remove(packagePath, errorCode);
+            syncFile(std::filesystem::path(AppInstallationPath));
+        }
+        // Drop only this version from the in-memory registry, so that dependency
+        // resolution no longer resolves to files that do not exist anymore
+        mInstalledPackages.erase(
+            std::remove_if(mInstalledPackages.begin(), mInstalledPackages.end(),
+                           [&packageId, &version](const std::unique_ptr<ConfigMetadataKey> &entry)
+                           { return entry->first == packageId && entry->second == version; }),
+            mInstalledPackages.end());
+        return Result::SUCCESS;
+    }
+
     /**
      * The following steps are performed
      * 1. Get dependency list first.

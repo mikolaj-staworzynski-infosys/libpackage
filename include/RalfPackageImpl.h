@@ -115,6 +115,7 @@ namespace packagemanager
          * since that version is not mounted (locked) yet.
          */
         Result GetApplicationsToRestart(const std::string &packageId, std::vector<std::string> &applicationIds) override;
+        Result Uninstall(const std::string &packageId, const std::string &version) override;
 
     private:
         // Flag to check initialisation status
