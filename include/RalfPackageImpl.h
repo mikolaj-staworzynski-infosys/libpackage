@@ -25,6 +25,7 @@
 #include <IPackageImpl.h>
 #include <ralf/Package.h>
 #include <ralf/VersionConstraint.h>
+#include <json/json.h>
 
 #include <sys/types.h> // For uid_t and gid_t
 
@@ -84,7 +85,7 @@ namespace packagemanager
 
         Result GetInstalledPackageMetadata(const std::string &packageId, const std::string &version, std::string &config) override;
 
-        Result GetConfigListForInstalledPackages(const std::string &filter, std::string &config ) override;
+        Result GetConfigListForInstalledPackages(const std::string &filter, std::string &config) override;
 
     private:
         // Flag to check initialisation status
@@ -196,6 +197,16 @@ namespace packagemanager
          * @param configMetadata The configuration metadata structure to be populated.
          * @return true if metadata extraction is successful; false otherwise.
          */
-        bool extractMetadataFromPackage(const ralf::Package &package,ConfigMetaData &configMetadata);
+        bool extractMetadataFromPackage(const ralf::Package &package, ConfigMetaData &configMetadata);
+
+        /**
+         * Retrieves the metadata of the specified package as a JSON object.
+         * @param packageId The ID of the package whose metadata is to be retrieved.
+         * @param version The version of the package whose metadata is to be retrieved.
+         * @param metadata The JSON object where the metadata will be stored.
+         * @return true if the metadata is successfully retrieved; false otherwise.
+         */
+        bool getMetadataAsJson(const std::string &packageId, const std::string &version, Json::Value &metadata);
     };
+
 }

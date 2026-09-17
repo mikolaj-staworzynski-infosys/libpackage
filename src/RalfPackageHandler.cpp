@@ -23,8 +23,8 @@
 #include <ralf/PackageMount.h>
 #include <ralf/PackageMetaData.h>
 #include <ralf/VersionNumber.h>
-#include <json/json.h>
 #include <fstream>
+#include <sstream>
 
 #include <cstdint>
 
@@ -117,14 +117,15 @@ namespace packagemanager
             std::cerr << "[libPackage] Failed to initialize verification bundle. No certificates loaded from: " << pkgCertDirPath << std::endl;
             return Result::FAILED;
         }
+        mIsInitialized = true;
         if (!std::filesystem::exists(AppInstallationPath))
         {
             std::cout << "[libPackage] App installation path does not exist. Creating: " << AppInstallationPath << std::endl;
             std::filesystem::create_directories(AppInstallationPath);
+            return Result::SUCCESS;
         }
         else
         {
-            mIsInitialized = true;
             std::vector<std::string> installedPackages;
             // Let us get package metadata of all installed packages
             auto count = getInstalledPackages(installedPackages);
@@ -140,7 +141,10 @@ namespace packagemanager
                     std::cerr << "[libPackage] Failed to open package: " << packagePath << std::endl;
                     continue;
                 }
-                if (!extractMetadataFromPackage(package, configMetadata))
+                appId = package->id();
+                appVersion = package->version().toString();
+
+                if (!extractMetadataFromPackage(package.value(), configMetadata))
                 {
                     std::cerr << "[libPackage] Warning!! Failed to extract metadata from package: " << packagePath << std::endl;
                     continue;
@@ -306,22 +310,30 @@ namespace packagemanager
             return Result::FAILED;
         }
         // TODO we need to remove the entries from mInstalledPackages vector. Since currently no version info is passed, this is on hold.
-        for (auto it = mInstalledPackages.begin(); it != mInstalledPackages.end(); ++it)
+        // For the time being, we will remove every instance of the package from the installed packages list.
+        for (auto it = mInstalledPackages.begin(); it != mInstalledPackages.end();)
         {
-            if ((*it)->packageId == packageId)
+            // the vector is a pair of packageId and version
+            if ((*it)->first == packageId)
             {
-                mInstalledPackages.erase(it);
-                break;
+                it = mInstalledPackages.erase(it);
+            }
+            else
+            {
+                ++it;
             }
         }
         // Remove the package from the dial packages list as well
         // TODO the same logic applies here as well.
-        for (auto it = mDialPackages.begin(); it != mDialPackages.end(); ++it)
+        for (auto it = mDialPackages.begin(); it != mDialPackages.end();)
         {
-            if ((*it)->packageId == packageId)
+            if ((*it)->first == packageId)
             {
-                mDialPackages.erase(it);
-                break;
+                it = mDialPackages.erase(it);
+            }
+            else
+            {
+                ++it;
             }
         }
         return Result::SUCCESS;
@@ -421,6 +433,9 @@ namespace packagemanager
             std::cerr << "[libPackage] Failed to open package for getting file metadata: " << fileLocator << std::endl;
             return Result::FAILED;
         }
+
+        packageId = package->id();
+        version = package->version().toString();
         if (extractMetadataFromPackage(package.value(), configMetadata) == false)
         {
             std::cerr << "[libPackage] Failed to extract metadata from package: " << fileLocator << std::endl;
@@ -436,23 +451,20 @@ namespace packagemanager
         auto pkgMetadata = package.metaData();
         if (!pkgMetadata)
         {
-            std::cerr << "[libPackage] Failed to read package metadata for extracting metadata: " << pkgMetadata.error().what() << std::endl;
+            std::cerr << "[libPackage] Failed to read package metadata for extracting metadata: " << package.metaData().error().what() << std::endl;
             return false;
         }
-
-        packageId = package->id();
-        version = package->version().toString();
 
         configMetadata.packageFormat = "ralf";
         configMetadata.userId = mUserId;   // Ralf user id.
         configMetadata.groupId = mGroupId; // Ralf user group.
-        auto pkgMetadata = package->metaData();
         if (pkgMetadata)
         {
-            configMetadata.mimeType = pkgMetadata->mimeType().value_or("");
-            if (pkgMetadata->applicationInfo())
+            auto pkgMetadataValue = pkgMetadata.value();
+            configMetadata.mimeType = pkgMetadataValue.mimeType();
+            if (pkgMetadataValue.applicationInfo())
             {
-                auto appInfo = pkgMetadata->applicationInfo();
+                auto appInfo = pkgMetadataValue.applicationInfo();
                 auto appInfoValue = appInfo.value();
                 addPackagePermissionsToConfigMetadata(appInfoValue, configMetadata);
                 configMetadata.dial = appInfoValue.dialInfo().has_value();
@@ -813,25 +825,17 @@ namespace packagemanager
             std::cerr << "[libPackage] RalfPackageImpl::GetInstalledPackageMetadata called before initialization." << std::endl;
             return Result::FAILED;
         }
-        // Step 1: Determine the package path
-        auto packagePath = std::filesystem::path(AppInstallationPath) / packageId / version / RalfPackage;
-        auto package = openPackage(packagePath);
-        if (!package)
-        {
-            std::cerr << "[libPackage] Failed to open package for getting installed metadata: " << packagePath.string() << std::endl;
-            return Result::FAILED;
-        }
-        auto packagejson = package->auxMetaDataFile(RDK_PACKAGE_CONFIG_MIME_TYPE);
-        if (packagejson)
-        {
-            const auto contents = packagejson->readAll();
-            if (contents)
-            {
-                config = std::string(reinterpret_cast<const char *>(contents->data()), contents->size());
-            }
-        }
+        Json::Value configJson;
 
-        return Result::SUCCESS;
+        if (getMetadataAsJson(packageId, version, configJson))
+        {
+            // Set indentation to ""
+            Json::StreamWriterBuilder writerBuilder;
+            writerBuilder["indentation"] = "";
+            config = Json::writeString(writerBuilder, configJson);
+            return Result::SUCCESS;
+        }
+        return Result::FAILED;
     }
     packagemanager::Result RalfPackageImpl::GetConfigListForInstalledPackages(const std::string &filter, std::string &config)
     {
@@ -842,6 +846,7 @@ namespace packagemanager
             std::cerr << "[libPackage] RalfPackageImpl::GetConfigListForInstalledPackages called before initialization." << std::endl;
             return Result::FAILED;
         }
+        std::cout << "[libPackage] RalfPackageImpl::GetConfigListForInstalledPackages called with filter: " << filter << std::endl;
 
         if (filter != "dial")
         {
@@ -849,37 +854,60 @@ namespace packagemanager
             return Result::FAILED;
         }
 
-        config.clear();
-        config = "[";
-        for (const auto &dialPackage : mDialPackages)
+        Json::Value dialConfigArray(Json::arrayValue);
+        for (const auto &pkgInfo : mDialPackages)
         {
-            if (dialPackage)
+            auto packageId = pkgInfo->first;
+            auto version = pkgInfo->second;
+            Json::Value parsedJson;
+            if (getMetadataAsJson(packageId, version, parsedJson))
             {
-                // Let us collect the package information for the Dial configuration
-                for (const auto &pkgInfo : mDialPackages)
-                {
-                    auto packageId = pkgInfo->first;
-                    auto version = pkgInfo->second;
-
-                    auto packagePath = std::filesystem::path(AppInstallationPath) / packageId / version / RalfPackage;
-                    auto package = openPackage(packagePath);
-                    if (!package)
-                    {
-                        std::cerr << "[libPackage] Failed to open package for getting config list: " << packagePath.string() << std::endl;
-                        continue;
-                    }
-                    auto packagejson = package->auxMetaDataFile(RDK_PACKAGE_CONFIG_MIME_TYPE);
-                    if (packagejson)
-                    {
-                        const auto contents = packagejson->readAll();
-                        if (contents)
-                        {
-                            config += "," + std::string(reinterpret_cast<const char *>(contents->data()), contents->size()) + "\n";
-                        }
-                    }
-                }
-                config += "]";
-                return Result::SUCCESS;
+                dialConfigArray.append(parsedJson);
             }
+        }
 
-        } // namespace packagemanager
+        // Set indentation to ""
+        Json::StreamWriterBuilder writerBuilder;
+        writerBuilder["indentation"] = "";
+        config = Json::writeString(writerBuilder, dialConfigArray);
+        return Result::SUCCESS;
+    }
+    bool RalfPackageImpl::getMetadataAsJson(const std::string &appId, const std::string &version, Json::Value &metadata)
+    {
+        auto packagePath = std::filesystem::path(AppInstallationPath) / appId / version / RalfPackage;
+        auto package = openPackage(packagePath);
+        if (!package)
+        {
+            std::cerr << "[libPackage] Failed to open package for getting config list: " << packagePath.string() << std::endl;
+            return false;
+        }
+
+        auto packagejson = package->auxMetaDataFile(RDK_PACKAGE_CONFIG_MIME_TYPE);
+        if (!packagejson)
+        {
+            std::cerr << "[libPackage] Failed to get auxMetaDataFile: " << packagejson.error().what() << std::endl;
+            return false;
+        }
+
+        const auto contents = packagejson->readAll();
+        if (!contents)
+        {
+            std::cerr << "[libPackage] Failed to read contents of auxMetaDataFile: " << packagePath.string() << std::endl;
+            return false;
+        }
+        std::string jsonContent(reinterpret_cast<const char *>(contents->data()), contents->size());
+
+        // So we have a json string in string format. Let us convert that to a json object.
+        Json::CharReaderBuilder readerBuilder;
+        std::string parseErrors;
+        std::istringstream jsonStream(jsonContent);
+
+        if (!Json::parseFromStream(readerBuilder, jsonStream, &metadata, &parseErrors))
+        {
+            std::cerr << "[libPackage] Failed to parse config JSON for dial package: " << packagePath.string()
+                      << ": " << parseErrors << std::endl;
+            return false;
+        }
+        return true;
+    }
+} // namespace packagemanager
