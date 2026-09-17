@@ -141,14 +141,15 @@ namespace packagemanager
                     std::cerr << "[libPackage] Failed to open package: " << packagePath << std::endl;
                     continue;
                 }
+                configMetadata.appPath = std::filesystem::path(packagePath);
                 appId = package->id();
-                appVersion = package->version().toString();
 
                 if (!extractMetadataFromPackage(package.value(), configMetadata))
                 {
                     std::cerr << "[libPackage] Warning!! Failed to extract metadata from package: " << packagePath << std::endl;
                     continue;
                 }
+                appVersion = package->version().toString();
                 auto configKey = std::make_shared<ConfigMetadataKey>(std::make_pair(appId, appVersion));
 
                 if (configMetadata.dial)
@@ -249,8 +250,18 @@ namespace packagemanager
                 << "[libPackage] Error installing package: " << e.what() << std::endl;
             return Result::FAILED;
         }
-        std::unique_ptr<ConfigMetadataKey> appIdVer = std::make_unique<ConfigMetadataKey>(std::make_pair(packageId, version));
-        mInstalledPackages.push_back(std::move(appIdVer));
+        auto configKey = std::make_shared<ConfigMetadataKey>(std::make_pair(packageId, version));
+
+        if (extractMetadataFromPackage(package.value(), configMetadata))
+        {
+
+            if (configMetadata.dial)
+            {
+                mDialPackages.push_back(configKey);
+            }
+        }
+        mInstalledPackages.push_back(configKey);
+
         return Result::SUCCESS;
     }
     bool RalfPackageImpl::checkPackageDependencies(const ralf::Package &package)

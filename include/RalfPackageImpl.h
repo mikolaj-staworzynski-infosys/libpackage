@@ -104,6 +104,9 @@ namespace packagemanager
         ralf::VerificationBundle mVerificationBundle;
 
         std::vector<std::shared_ptr<ConfigMetadataKey> > mInstalledPackages;
+        // This vector holds the keys for all installed packages that has dial support
+        // This is debatable as we use this call only during bootup. So does it makes sense to makke another
+        // data structure to hold this info?
         std::vector<std::shared_ptr<ConfigMetadataKey> > mDialPackages;
 
         /**
@@ -186,7 +189,7 @@ namespace packagemanager
 
         /**
          * Adds the permissions from the package metadata to the configuration metadata.
-         * @param pkgMetadata The package metadata whose permissions are to be added.
+         * @param configMetadata The package metadata whose permissions are to be added.
          * @param appInfo The application info from which the permissions will be added to the configuration metadata.
          */
         void addPackagePermissionsToConfigMetadata(const ralf::ApplicationInfo &appInfo, ConfigMetaData &configMetadata);
