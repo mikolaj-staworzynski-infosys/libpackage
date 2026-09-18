@@ -20,6 +20,7 @@
 #include "RalfPackageImpl.h"
 #include <iostream>
 #include <filesystem>
+#include <algorithm>
 #include <ralf/PackageMount.h>
 #include <ralf/PackageMetaData.h>
 #include <ralf/VersionNumber.h>
@@ -28,6 +29,8 @@
 
 #include <cstdint>
 
+#include <fcntl.h>  // For open()
+#include <unistd.h> // For fsync()/close()
 #include <pwd.h> //For getting user id and group id of ralf user
 
 namespace
@@ -37,6 +40,55 @@ namespace
     static constexpr const char *RalfPackage = "package.ralf";
     static constexpr const char *pkgCertDirPath = RDK_PACKAGE_CERT_PATH;
     static constexpr const char *BuildReference = BUILD_REFERENCE;
+
+    // Flushes a file's (or directory's) data and metadata to disk. Used to make the
+    // staged package file durable before atomically renaming it into place.
+    static bool syncFile(const std::filesystem::path &path)
+    {
+        int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0)
+        {
+            return false;
+        }
+        bool ok = (::fsync(fd) == 0);
+        ::close(fd);
+        return ok;
+    }
+
+    // Removes staging files left behind by installs that were terminated after staging but
+    // before the atomic rename. Package discovery only recognizes the exact package.ralf
+    // name, so without this sweep such leftovers would accumulate in persistent storage on
+    // every crash. Callers serialize Install calls and Initialize runs before any Install of
+    // this process, so every staging file found here belongs to a dead installer and can be
+    // removed outright - no ownership check is needed.
+    static void cleanupStaleStagingFiles()
+    {
+        const std::string stagingPrefix = std::string(RalfPackage) + ".tmp";
+        std::error_code ec;
+        const std::filesystem::recursive_directory_iterator end;
+        for (std::filesystem::recursive_directory_iterator it(AppInstallationPath, ec); it != end; it.increment(ec))
+        {
+            if (!it->is_regular_file(ec))
+            {
+                continue;
+            }
+            const auto fileName = it->path().filename().string();
+            if (fileName.find(stagingPrefix) != 0 ||
+                (fileName.size() > stagingPrefix.size() && fileName[stagingPrefix.size()] != '.'))
+            {
+                continue;
+            }
+            if (std::filesystem::remove(it->path(), ec))
+            {
+                std::cout << "[libPackage] Removed stale staging file: " << it->path() << std::endl;
+            }
+            else if (ec)
+            {
+                std::cerr << "[libPackage] Failed to remove stale staging file: " << it->path() << ": " << ec.message() << std::endl;
+                ec.clear();
+            }
+        }
+    }
 }
 namespace packagemanager
 {
@@ -121,11 +173,31 @@ namespace packagemanager
         if (!std::filesystem::exists(AppInstallationPath))
         {
             std::cout << "[libPackage] App installation path does not exist. Creating: " << AppInstallationPath << std::endl;
+            // Record which path components are missing before creating the root, so each new
+            // directory entry can be fsynced from its parent. Install's durability chain stops
+            // at AppInstallationPath, so without this a crash could lose the entire newly
+            // created installation tree even though installs report success.
+            std::vector<std::filesystem::path> createdDirs;
+            for (auto dir = std::filesystem::path(AppInstallationPath); !dir.empty() && !std::filesystem::exists(dir); dir = dir.parent_path())
+            {
+                createdDirs.push_back(dir);
+            }
             std::filesystem::create_directories(AppInstallationPath);
+            for (const auto &createdDir : createdDirs)
+            {
+                if (!syncFile(createdDir.parent_path()))
+                {
+                    std::cerr << "[libPackage] Warning: failed to sync directory to disk: " << createdDir.parent_path()
+                              << " (installation root may not survive a crash)" << std::endl;
+                }
+            }
             return Result::SUCCESS;
         }
         else
         {
+            // Reclaim staging files left behind by interrupted installs before scanning.
+            cleanupStaleStagingFiles();
+
             std::vector<std::string> installedPackages;
             // Let us get package metadata of all installed packages
             auto count = getInstalledPackages(installedPackages);
@@ -228,15 +300,75 @@ namespace packagemanager
                 return Result::FAILED;
         }
 
-        // Create the directory structure
+        // Create the directory structure. Remember which path components do not exist yet:
+        // syncing packagePath after the rename only persists the package file's entry, not the
+        // newly created packageId/version directory entries - those live in their parents and
+        // each affected parent must be fsynced separately for the new path to survive a crash.
         auto packagePath = std::filesystem::path(AppInstallationPath) / packageId / version;
+        std::vector<std::filesystem::path> createdDirs;
+        for (auto dir = packagePath; dir != AppInstallationPath && !std::filesystem::exists(dir); dir = dir.parent_path())
+        {
+            createdDirs.push_back(dir);
+        }
         std::filesystem::create_directories(packagePath);
 
-        //  Copy the package to the installation directory
+        // Install the package by staging it in a temporary file and atomically renaming it
+        // into place. If the package is currently mounted (loop device + dm-verity), the loop
+        // device keeps the old inode alive, so a running app keeps using the old image until it
+        // is unmounted, while future mounts pick up the new file. Overwriting the file in place
+        // (copy_file with overwrite_existing directly on the destination) would corrupt the
+        // live mount.
         auto destRalfPackagePath = packagePath / RalfPackage;
+        // Callers serialize Install calls, so a single deterministic staging name is safe:
+        // no other install can touch it while it is being written, synced or renamed. A file
+        // left here by a crashed install is removed by cleanupStaleStagingFiles() at startup.
+        auto tempRalfPackagePath = packagePath / (std::string(RalfPackage) + ".tmp");
         try
         {
-            std::filesystem::copy_file(fileLocator, destRalfPackagePath, std::filesystem::copy_options::overwrite_existing);
+            std::filesystem::copy_file(fileLocator, tempRalfPackagePath, std::filesystem::copy_options::overwrite_existing);
+            if (std::filesystem::exists(destRalfPackagePath))
+            {
+                // Swapping an existing installation: keep the original file permissions
+                std::filesystem::permissions(tempRalfPackagePath, std::filesystem::status(destRalfPackagePath).permissions());
+            }
+            if (!syncFile(tempRalfPackagePath))
+            {
+                std::cerr << "[libPackage] Failed to sync package file to disk: " << tempRalfPackagePath << std::endl;
+                std::filesystem::remove(tempRalfPackagePath);
+                return Result::FAILED;
+            }
+            std::filesystem::rename(tempRalfPackagePath, destRalfPackagePath);
+            // The rename is the commit point: once it succeeds the new package is visible at
+            // the destination, so the install is a fact and the registration below matches
+            // the on-disk state. Crash analysis of this sequence (fsync data -> atomic rename
+            // -> fsync directory):
+            //   1. All fsyncs succeed: the new package is durable, period.
+            //   2. Crash before the fsyncs: the rename may or may not have reached the disk,
+            //      but since the file's data was fsynced BEFORE its name was moved into
+            //      place and the rename is atomic, the post-crash state is always either the
+            //      old package or the complete new package - never a torn package.ralf.
+            //   3. A directory fsync fails below: case 2 with unknown durability. The running
+            //      system still sees the new package, so in-memory registration matches disk;
+            //      after a power loss the boot-time rescan rebuilds registration from
+            //      whatever actually survived. Hence a failure here is logged as a warning,
+            //      not returned as FAILED - FAILED would misreport an install that did
+            //      happen and would itself create the "installed but unregistered" state.
+            if (!syncFile(packagePath))
+            {
+                std::cerr << "[libPackage] Warning: failed to sync package directory to disk: " << packagePath
+                          << " (package is installed but may not survive a crash)" << std::endl;
+            }
+            // Fsync the parents of any directories created above, so the new packageId/version
+            // directory entries themselves are durable; same post-commit warning-only treatment.
+            for (const auto &createdDir : createdDirs)
+            {
+                if (!syncFile(createdDir.parent_path()))
+                {
+                    std::cerr << "[libPackage] Warning: failed to sync directory to disk: " << createdDir.parent_path()
+                              << " (package is installed but may not survive a crash)" << std::endl;
+                }
+            }
+
             auto appPath = destRalfPackagePath.string();
             configMetadata.appPath = std::move(appPath);
             configMetadata.userId = mUserId;   // Ralf user id.
@@ -248,19 +380,45 @@ namespace packagemanager
             // Log error
             std::cerr
                 << "[libPackage] Error installing package: " << e.what() << std::endl;
+            std::error_code ec;
+            std::filesystem::remove(tempRalfPackagePath, ec);
             return Result::FAILED;
         }
         auto configKey = std::make_shared<ConfigMetadataKey>(std::make_pair(packageId, version));
 
         if (extractMetadataFromPackage(package.value(), configMetadata))
         {
-
             if (configMetadata.dial)
+            {   
+                // a re-installed package may have been registered before
+                // without its dial metadata
+                const auto isAlreadyDialRegistered = std::any_of(mDialPackages.begin(), mDialPackages.end(),
+                                                                 [&packageId, &version](const std::shared_ptr<ConfigMetadataKey> &entry)
+                                                                 { return entry->first == packageId && entry->second == version; });
+                if (!isAlreadyDialRegistered)
+                {
+                    mDialPackages.push_back(configKey);
+                }
+            }
+            else
             {
-                mDialPackages.push_back(configKey);
+                // a re-installed package may no longer carry dial metadata;
+                // drop any stale dial registration for it
+                mDialPackages.erase(std::remove_if(mDialPackages.begin(), mDialPackages.end(),
+                                                   [&packageId, &version](const std::shared_ptr<ConfigMetadataKey> &entry)
+                                                   { return entry->first == packageId && entry->second == version; }),
+                                    mDialPackages.end());
             }
         }
-        mInstalledPackages.push_back(configKey);
+
+        // On a re-install (file swap) of an already known package, do not register it twice
+        const auto isAlreadyRegistered = std::any_of(mInstalledPackages.begin(), mInstalledPackages.end(),
+                                                     [&packageId, &version](const std::shared_ptr<ConfigMetadataKey> &entry)
+                                                     { return entry->first == packageId && entry->second == version; });
+        if (!isAlreadyRegistered)
+        {
+            mInstalledPackages.push_back(configKey);
+        }
 
         return Result::SUCCESS;
     }
