@@ -20,6 +20,7 @@
 #include "RalfPackageImpl.h"
 #include <iostream>
 #include <filesystem>
+#include <algorithm>
 #include <ralf/PackageMount.h>
 #include <ralf/PackageMetaData.h>
 #include <ralf/VersionNumber.h>
@@ -28,6 +29,8 @@
 
 #include <cstdint>
 
+#include <fcntl.h>  // For open()
+#include <unistd.h> // For fsync()/close()
 #include <pwd.h> //For getting user id and group id of ralf user
 
 namespace
@@ -37,6 +40,20 @@ namespace
     static constexpr const char *RalfPackage = "package.ralf";
     static constexpr const char *pkgCertDirPath = RDK_PACKAGE_CERT_PATH;
     static constexpr const char *BuildReference = BUILD_REFERENCE;
+
+    // Flushes a file's (or directory's) data and metadata to disk. Used to make the
+    // staged package file durable before atomically renaming it into place.
+    static bool syncFile(const std::filesystem::path &path)
+    {
+        int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0)
+        {
+            return false;
+        }
+        bool ok = (::fsync(fd) == 0);
+        ::close(fd);
+        return ok;
+    }
 }
 namespace packagemanager
 {
@@ -232,11 +249,31 @@ namespace packagemanager
         auto packagePath = std::filesystem::path(AppInstallationPath) / packageId / version;
         std::filesystem::create_directories(packagePath);
 
-        //  Copy the package to the installation directory
+        // Install the package by staging it in a temporary file and atomically renaming it
+        // into place. If the package is currently mounted (loop device + dm-verity), the loop
+        // device keeps the old inode alive, so a running app keeps using the old image until it
+        // is unmounted, while future mounts pick up the new file. Overwriting the file in place
+        // (copy_file with overwrite_existing directly on the destination) would corrupt the
+        // live mount.
         auto destRalfPackagePath = packagePath / RalfPackage;
+        auto tempRalfPackagePath = packagePath / (std::string(RalfPackage) + ".tmp");
         try
         {
-            std::filesystem::copy_file(fileLocator, destRalfPackagePath, std::filesystem::copy_options::overwrite_existing);
+            std::filesystem::copy_file(fileLocator, tempRalfPackagePath, std::filesystem::copy_options::overwrite_existing);
+            if (std::filesystem::exists(destRalfPackagePath))
+            {
+                // Swapping an existing installation: keep the original file permissions
+                std::filesystem::permissions(tempRalfPackagePath, std::filesystem::status(destRalfPackagePath).permissions());
+            }
+            if (!syncFile(tempRalfPackagePath))
+            {
+                std::cerr << "[libPackage] Failed to sync package file to disk: " << tempRalfPackagePath << std::endl;
+                std::filesystem::remove(tempRalfPackagePath);
+                return Result::FAILED;
+            }
+            std::filesystem::rename(tempRalfPackagePath, destRalfPackagePath);
+            syncFile(packagePath); // Flush the directory entry so the rename is durable
+
             auto appPath = destRalfPackagePath.string();
             configMetadata.appPath = std::move(appPath);
             configMetadata.userId = mUserId;   // Ralf user id.
@@ -248,19 +285,36 @@ namespace packagemanager
             // Log error
             std::cerr
                 << "[libPackage] Error installing package: " << e.what() << std::endl;
+            std::error_code ec;
+            std::filesystem::remove(tempRalfPackagePath, ec);
             return Result::FAILED;
         }
         auto configKey = std::make_shared<ConfigMetadataKey>(std::make_pair(packageId, version));
 
         if (extractMetadataFromPackage(package.value(), configMetadata))
         {
-
             if (configMetadata.dial)
-            {
-                mDialPackages.push_back(configKey);
+            {   
+                // a re-installed package may have been registered before
+                // without its dial metadata
+                const auto isAlreadyDialRegistered = std::any_of(mDialPackages.begin(), mDialPackages.end(),
+                                                                 [&packageId, &version](const std::shared_ptr<ConfigMetadataKey> &entry)
+                                                                 { return entry->first == packageId && entry->second == version; });
+                if (!isAlreadyDialRegistered)
+                {
+                    mDialPackages.push_back(configKey);
+                }
             }
         }
-        mInstalledPackages.push_back(configKey);
+
+        // On a re-install (file swap) of an already known package, do not register it twice
+        const auto isAlreadyRegistered = std::any_of(mInstalledPackages.begin(), mInstalledPackages.end(),
+                                                     [&packageId, &version](const std::shared_ptr<ConfigMetadataKey> &entry)
+                                                     { return entry->first == packageId && entry->second == version; });
+        if (!isAlreadyRegistered)
+        {
+            mInstalledPackages.push_back(configKey);
+        }
 
         return Result::SUCCESS;
     }
