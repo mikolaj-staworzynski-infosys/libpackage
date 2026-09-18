@@ -23,8 +23,8 @@
 #include <ralf/PackageMount.h>
 #include <ralf/PackageMetaData.h>
 #include <ralf/VersionNumber.h>
-#include <json/json.h>
 #include <fstream>
+#include <sstream>
 
 #include <cstdint>
 
@@ -88,15 +88,6 @@ namespace packagemanager
         return false;
     }
 
-    void RalfPackageImpl::getPackageIdAndVersionFromRalfPackage(const std::string &packagePath, std::string &appId, std::string &appVersion)
-    {
-        std::filesystem::path p(packagePath);
-        auto parentPath = p.parent_path();
-        appVersion = parentPath.filename().string();
-        auto grandParentPath = parentPath.parent_path();
-        appId = grandParentPath.filename().string();
-    }
-
     std::shared_ptr<IPackageImpl> IPackageImpl::instance()
     {
         std::shared_ptr<IPackageImpl> packageImpl = std::make_shared<RalfPackageImpl>();
@@ -126,10 +117,12 @@ namespace packagemanager
             std::cerr << "[libPackage] Failed to initialize verification bundle. No certificates loaded from: " << pkgCertDirPath << std::endl;
             return Result::FAILED;
         }
+        mIsInitialized = true;
         if (!std::filesystem::exists(AppInstallationPath))
         {
             std::cout << "[libPackage] App installation path does not exist. Creating: " << AppInstallationPath << std::endl;
             std::filesystem::create_directories(AppInstallationPath);
+            return Result::SUCCESS;
         }
         else
         {
@@ -141,19 +134,36 @@ namespace packagemanager
             for (auto packagePath : installedPackages)
             {
                 std::string appId, appVersion;
-                getPackageIdAndVersionFromRalfPackage(packagePath, appId, appVersion);
-                mInstalledPackages.push_back(std::make_unique<ConfigMetadataKey>(std::make_pair(appId, appVersion)));
-                std::cout << "[libPackage] Found installed package: " << appId << ", version: " << appVersion << std::endl;
                 ConfigMetaData configMetadata;
+                auto package = openPackage(packagePath);
+                if (!package)
+                {
+                    std::cerr << "[libPackage] Failed to open package: " << packagePath << std::endl;
+                    continue;
+                }
                 configMetadata.appPath = std::filesystem::path(packagePath);
-                configMetadata.userId = mUserId;   // Ralf user id.
-                configMetadata.groupId = mGroupId; // Ralf user group.
+                appId = package->id();
+
+                if (!extractMetadataFromPackage(package.value(), configMetadata))
+                {
+                    std::cerr << "[libPackage] Warning!! Failed to extract metadata from package: " << packagePath << std::endl;
+                    continue;
+                }
+                appVersion = package->version().toString();
+                auto configKey = std::make_shared<ConfigMetadataKey>(std::make_pair(appId, appVersion));
+
+                if (configMetadata.dial)
+                {
+                    mDialPackages.push_back(configKey);
+                }
+                mInstalledPackages.push_back(configKey);
+                std::cout << "[libPackage] Found installed package: " << appId << ", version: " << appVersion << std::endl;
 
                 ConfigMetadataKey appKey = {appId, appVersion};
                 aConfigMetadata[appKey] = configMetadata;
             }
         }
-        mIsInitialized = true;
+
         return Result::SUCCESS;
     }
     bool RalfPackageImpl::initializeVerificationBundle()
@@ -240,8 +250,18 @@ namespace packagemanager
                 << "[libPackage] Error installing package: " << e.what() << std::endl;
             return Result::FAILED;
         }
-        std::unique_ptr<ConfigMetadataKey> appIdVer = std::make_unique<ConfigMetadataKey>(std::make_pair(packageId, version));
-        mInstalledPackages.push_back(std::move(appIdVer));
+        auto configKey = std::make_shared<ConfigMetadataKey>(std::make_pair(packageId, version));
+
+        if (extractMetadataFromPackage(package.value(), configMetadata))
+        {
+
+            if (configMetadata.dial)
+            {
+                mDialPackages.push_back(configKey);
+            }
+        }
+        mInstalledPackages.push_back(configKey);
+
         return Result::SUCCESS;
     }
     bool RalfPackageImpl::checkPackageDependencies(const ralf::Package &package)
@@ -299,6 +319,33 @@ namespace packagemanager
             std::cerr
                 << "[libPackage] Error uninstalling package: " << e.what() << std::endl;
             return Result::FAILED;
+        }
+        // TODO we need to remove the entries from mInstalledPackages vector. Since currently no version info is passed, this is on hold.
+        // For the time being, we will remove every instance of the package from the installed packages list.
+        for (auto it = mInstalledPackages.begin(); it != mInstalledPackages.end();)
+        {
+            // the vector is a pair of packageId and version
+            if ((*it)->first == packageId)
+            {
+                it = mInstalledPackages.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        // Remove the package from the dial packages list as well
+        // TODO the same logic applies here as well.
+        for (auto it = mDialPackages.begin(); it != mDialPackages.end();)
+        {
+            if ((*it)->first == packageId)
+            {
+                it = mDialPackages.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
         }
         return Result::SUCCESS;
     }
@@ -398,16 +445,43 @@ namespace packagemanager
             return Result::FAILED;
         }
 
-        auto packagePath = std::filesystem::path(fileLocator);
         packageId = package->id();
         version = package->version().toString();
+        if (extractMetadataFromPackage(package.value(), configMetadata) == false)
+        {
+            std::cerr << "[libPackage] Failed to extract metadata from package: " << fileLocator << std::endl;
+            return Result::FAILED;
+        }
+        auto packagePath = std::filesystem::path(fileLocator);
         configMetadata.appPath = packagePath.string();
+        return Result::SUCCESS;
+    }
+
+    bool RalfPackageImpl::extractMetadataFromPackage(const ralf::Package &package, ConfigMetaData &configMetadata)
+    {
+        auto pkgMetadata = package.metaData();
+        if (!pkgMetadata)
+        {
+            std::cerr << "[libPackage] Failed to read package metadata for extracting metadata: " << package.metaData().error().what() << std::endl;
+            return false;
+        }
+
+        configMetadata.packageFormat = "ralf";
         configMetadata.userId = mUserId;   // Ralf user id.
         configMetadata.groupId = mGroupId; // Ralf user group.
-        auto pkgMetadata = package->metaData();
         if (pkgMetadata)
-            addPackagePermissionsToConfigMetadata(pkgMetadata.value(), configMetadata);
-        return Result::SUCCESS;
+        {
+            auto pkgMetadataValue = pkgMetadata.value();
+            configMetadata.mimeType = pkgMetadataValue.mimeType();
+            if (pkgMetadataValue.applicationInfo())
+            {
+                auto appInfo = pkgMetadataValue.applicationInfo();
+                auto appInfoValue = appInfo.value();
+                addPackagePermissionsToConfigMetadata(appInfoValue, configMetadata);
+                configMetadata.dial = appInfoValue.dialInfo().has_value();
+            }
+        }
+        return true;
     }
 
     bool RalfPackageImpl::lockPackage(const ralf::Package &package, std::vector<RalfPackageInfo> &ralfMountInfo, ConfigMetaData &configMetadata)
@@ -469,7 +543,10 @@ namespace packagemanager
             return false;
         }
         // Let us get permissions. from package.
-        addPackagePermissionsToConfigMetadata(pkgMetadata.value(), configMetadata);
+        if (!extractMetadataFromPackage(package, configMetadata))
+        {
+            std::cerr << "[libPackage] Warning!! Failed to extract metadata from package: " << package.id() << std::endl;
+        }
 
         // At this point all dependencies are already mounted. if the packages are already mounted, we have metadata, so return.
         if (mMountedPackages.find(pkgVerKey) != mMountedPackages.end())
@@ -729,37 +806,23 @@ namespace packagemanager
         groupId = pwd->pw_gid;
         return true;
     }
-    void RalfPackageImpl::addPackagePermissionsToConfigMetadata(const ralf::PackageMetaData &pkgMetadata, ConfigMetaData &configMetadata)
+    void RalfPackageImpl::addPackagePermissionsToConfigMetadata(const ralf::ApplicationInfo &appInfo, ConfigMetaData &configMetadata)
     {
-        // Check if the type is application, otherwise we should not be looking for permissions.
-        if (pkgMetadata.type() != ralf::PackageType::Application)
-        {
-            std::cout << "[libPackage] Package type is not application. Skipping permissions extraction." << std::endl;
-            return;
-        }
         // Permissions are present in applicationInfo section of metadata.
-        auto appInfo = pkgMetadata.applicationInfo();
-        if (appInfo)
-        {
-            auto permissions = appInfo->permissions();
+        auto permissions = appInfo.permissions();
 
-            auto perms = permissions.all();
-            std::string permissionsStr;
-            for (const auto &perm : perms)
-            {
-                permissionsStr += perm + ",";
-            }
-            if (!permissionsStr.empty())
-            {
-                // Remove the trailing comma
-                permissionsStr.pop_back();
-                configMetadata.capabilities = permissionsStr;
-                std::cout << "[libPackage] Added package permissions to config metadata: " << permissionsStr << std::endl;
-            }
-        }
-        else
+        auto perms = permissions.all();
+        std::string permissionsStr;
+        for (const auto &perm : perms)
         {
-            std::cerr << "[libPackage] No application info found in package metadata." << std::endl;
+            permissionsStr += perm + ",";
+        }
+        if (!permissionsStr.empty())
+        {
+            // Remove the trailing comma
+            permissionsStr.pop_back();
+            configMetadata.capabilities = permissionsStr;
+            std::cout << "[libPackage] Added package permissions to config metadata: " << permissionsStr << std::endl;
         }
     }
     packagemanager::Result RalfPackageImpl::GetInstalledPackageMetadata(const std::string &packageId, const std::string &version, std::string &config)
@@ -773,24 +836,89 @@ namespace packagemanager
             std::cerr << "[libPackage] RalfPackageImpl::GetInstalledPackageMetadata called before initialization." << std::endl;
             return Result::FAILED;
         }
-        // Step 1: Determine the package path
-        auto packagePath = std::filesystem::path(AppInstallationPath) / packageId / version / RalfPackage;
-        auto package = openPackage(packagePath);
-        if (!package)
+        Json::Value configJson;
+
+        if (getMetadataAsJson(packageId, version, configJson))
         {
-            std::cerr << "[libPackage] Failed to open package for getting installed metadata: " << packagePath.string() << std::endl;
+            // Set indentation to ""
+            Json::StreamWriterBuilder writerBuilder;
+            writerBuilder["indentation"] = "";
+            config = Json::writeString(writerBuilder, configJson);
+            return Result::SUCCESS;
+        }
+        return Result::FAILED;
+    }
+    packagemanager::Result RalfPackageImpl::GetConfigListForInstalledPackages(const std::string &filter, std::string &config)
+    {
+        // This method expects a filter. Currently the only supported filter is dial.
+        //  Open all installed packages , identify application package, check if the package supports dial, then add it to a json array
+        if (!mIsInitialized)
+        {
+            std::cerr << "[libPackage] RalfPackageImpl::GetConfigListForInstalledPackages called before initialization." << std::endl;
             return Result::FAILED;
         }
-        auto packagejson = package->auxMetaDataFile(RDK_PACKAGE_CONFIG_MIME_TYPE);
-        if (packagejson)
+        std::cout << "[libPackage] RalfPackageImpl::GetConfigListForInstalledPackages called with filter: " << filter << std::endl;
+
+        if (filter != "dial")
         {
-            const auto contents = packagejson->readAll();
-            if (contents)
+            std::cerr << "[libPackage] Unsupported filter: " << filter << std::endl;
+            return Result::FAILED;
+        }
+
+        Json::Value dialConfigArray(Json::arrayValue);
+        for (const auto &pkgInfo : mDialPackages)
+        {
+            auto packageId = pkgInfo->first;
+            auto version = pkgInfo->second;
+            Json::Value parsedJson;
+            if (getMetadataAsJson(packageId, version, parsedJson))
             {
-                config = std::string(reinterpret_cast<const char *>(contents->data()), contents->size());
+                dialConfigArray.append(parsedJson);
             }
         }
 
+        // Set indentation to ""
+        Json::StreamWriterBuilder writerBuilder;
+        writerBuilder["indentation"] = "";
+        config = Json::writeString(writerBuilder, dialConfigArray);
         return Result::SUCCESS;
+    }
+    bool RalfPackageImpl::getMetadataAsJson(const std::string &appId, const std::string &version, Json::Value &metadata)
+    {
+        auto packagePath = std::filesystem::path(AppInstallationPath) / appId / version / RalfPackage;
+        auto package = openPackage(packagePath);
+        if (!package)
+        {
+            std::cerr << "[libPackage] Failed to open package for getting config list: " << packagePath.string() << std::endl;
+            return false;
+        }
+
+        auto packagejson = package->auxMetaDataFile(RDK_PACKAGE_CONFIG_MIME_TYPE);
+        if (!packagejson)
+        {
+            std::cerr << "[libPackage] Failed to get auxMetaDataFile: " << packagejson.error().what() << std::endl;
+            return false;
+        }
+
+        const auto contents = packagejson->readAll();
+        if (!contents)
+        {
+            std::cerr << "[libPackage] Failed to read contents of auxMetaDataFile: " << packagePath.string() << std::endl;
+            return false;
+        }
+        std::string jsonContent(reinterpret_cast<const char *>(contents->data()), contents->size());
+
+        // So we have a json string in string format. Let us convert that to a json object.
+        Json::CharReaderBuilder readerBuilder;
+        std::string parseErrors;
+        std::istringstream jsonStream(jsonContent);
+
+        if (!Json::parseFromStream(readerBuilder, jsonStream, &metadata, &parseErrors))
+        {
+            std::cerr << "[libPackage] Failed to parse config JSON for dial package: " << packagePath.string()
+                      << ": " << parseErrors << std::endl;
+            return false;
+        }
+        return true;
     }
 } // namespace packagemanager
