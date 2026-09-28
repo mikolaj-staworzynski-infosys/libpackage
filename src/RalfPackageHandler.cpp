@@ -20,6 +20,7 @@
 #include "RalfPackageImpl.h"
 #include <iostream>
 #include <filesystem>
+#include <algorithm>
 #include <ralf/PackageMount.h>
 #include <ralf/PackageMetaData.h>
 #include <ralf/VersionNumber.h>
@@ -28,6 +29,8 @@
 
 #include <cstdint>
 
+#include <fcntl.h>  // For open()
+#include <unistd.h> // For fsync()/close()
 #include <pwd.h> //For getting user id and group id of ralf user
 
 namespace
@@ -37,6 +40,66 @@ namespace
     static constexpr const char *RalfPackage = "package.ralf";
     static constexpr const char *pkgCertDirPath = RDK_PACKAGE_CERT_PATH;
     static constexpr const char *BuildReference = BUILD_REFERENCE;
+
+    // A (packageId, version) key is safe to use in filesystem paths if the id is a plain
+    // path component (non-empty, not "." or "..", no separator) and the version parses as a
+    // ralf version number - that grammar excludes separators and "..", so a valid version is
+    // always a safe path component.
+    static bool isPathSafePackageKey(const std::string &packageId, const std::string &version)
+    {
+        return !packageId.empty() && packageId != "." && packageId != ".." &&
+               packageId.find('/') == std::string::npos &&
+               static_cast<bool>(ralf::VersionNumber::fromString(version));
+    }
+
+    // Flushes a file's (or directory's) data and metadata to disk. Used to make the
+    // staged package file durable before atomically renaming it into place.
+    static bool syncFile(const std::filesystem::path &path)
+    {
+        int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0)
+        {
+            return false;
+        }
+        bool ok = (::fsync(fd) == 0);
+        ::close(fd);
+        return ok;
+    }
+
+    // Removes staging files left behind by installs that were terminated after staging but
+    // before the atomic rename. Package discovery only recognizes the exact package.ralf
+    // name, so without this sweep such leftovers would accumulate in persistent storage on
+    // every crash. Callers serialize Install calls and Initialize runs before any Install of
+    // this process, so every staging file found here belongs to a dead installer and can be
+    // removed outright - no ownership check is needed.
+    static void cleanupStaleStagingFiles()
+    {
+        const std::string stagingPrefix = std::string(RalfPackage) + ".tmp";
+        std::error_code ec;
+        const std::filesystem::recursive_directory_iterator end;
+        for (std::filesystem::recursive_directory_iterator it(AppInstallationPath, ec); it != end; it.increment(ec))
+        {
+            if (!it->is_regular_file(ec))
+            {
+                continue;
+            }
+            const auto fileName = it->path().filename().string();
+            if (fileName.find(stagingPrefix) != 0 ||
+                (fileName.size() > stagingPrefix.size() && fileName[stagingPrefix.size()] != '.'))
+            {
+                continue;
+            }
+            if (std::filesystem::remove(it->path(), ec))
+            {
+                std::cout << "[libPackage] Removed stale staging file: " << it->path() << std::endl;
+            }
+            else if (ec)
+            {
+                std::cerr << "[libPackage] Failed to remove stale staging file: " << it->path() << ": " << ec.message() << std::endl;
+                ec.clear();
+            }
+        }
+    }
 }
 namespace packagemanager
 {
@@ -121,11 +184,31 @@ namespace packagemanager
         if (!std::filesystem::exists(AppInstallationPath))
         {
             std::cout << "[libPackage] App installation path does not exist. Creating: " << AppInstallationPath << std::endl;
+            // Record which path components are missing before creating the root, so each new
+            // directory entry can be fsynced from its parent. Install's durability chain stops
+            // at AppInstallationPath, so without this a crash could lose the entire newly
+            // created installation tree even though installs report success.
+            std::vector<std::filesystem::path> createdDirs;
+            for (auto dir = std::filesystem::path(AppInstallationPath); !dir.empty() && !std::filesystem::exists(dir); dir = dir.parent_path())
+            {
+                createdDirs.push_back(dir);
+            }
             std::filesystem::create_directories(AppInstallationPath);
+            for (const auto &createdDir : createdDirs)
+            {
+                if (!syncFile(createdDir.parent_path()))
+                {
+                    std::cerr << "[libPackage] Warning: failed to sync directory to disk: " << createdDir.parent_path()
+                              << " (installation root may not survive a crash)" << std::endl;
+                }
+            }
             return Result::SUCCESS;
         }
         else
         {
+            // Reclaim staging files left behind by interrupted installs before scanning.
+            cleanupStaleStagingFiles();
+
             std::vector<std::string> installedPackages;
             // Let us get package metadata of all installed packages
             auto count = getInstalledPackages(installedPackages);
@@ -214,6 +297,13 @@ namespace packagemanager
             return Result::FAILED;
         }
         std::cout << "[libPackage] RalfPackageImpl::Install called with packageId: " << packageId << ", version: " << version << ", fileLocator: " << fileLocator << std::endl;
+        // packageId/version are caller-supplied and used in filesystem paths below; reject
+        // anything that is not a path-safe key before touching the filesystem.
+        if (!isPathSafePackageKey(packageId, version))
+        {
+            std::cerr << "[libPackage] Invalid packageId/version: " << packageId << ", " << version << std::endl;
+            return Result::FAILED;
+        }
         auto package = openPackage(fileLocator, true);
         if (!package)
         {
@@ -222,21 +312,108 @@ namespace packagemanager
         }
         std::cout << "[libPackage] Successfully opened package: " << fileLocator << std::endl;
 
+        // Registration (here) and the boot-time scan (Initialize) must use the same canonical
+        // id/version key, and the caller's arguments also name the on-disk directories.
+        // Reject a mismatch with the embedded metadata so a package can never be registered
+        // under one key and discovered under another.
+        if (package->id() != packageId || package->version().toString() != version)
+        {
+            std::cerr << "[libPackage] Package metadata mismatch: requested " << packageId << ", " << version
+                      << " but package contains " << package->id() << ", " << package->version().toString() << std::endl;
+            return Result::FAILED;
+        }
+
         if (enableDependencyCheck)
         {
             if (!checkPackageDependencies(package.value()))
                 return Result::FAILED;
         }
 
-        // Create the directory structure
+        // Create the directory structure. Remember which path components do not exist yet:
+        // syncing packagePath after the rename only persists the package file's entry, not the
+        // newly created packageId/version directory entries - those live in their parents and
+        // each affected parent must be fsynced separately for the new path to survive a crash.
         auto packagePath = std::filesystem::path(AppInstallationPath) / packageId / version;
+        std::vector<std::filesystem::path> createdDirs;
+        for (auto dir = packagePath; dir != AppInstallationPath && !std::filesystem::exists(dir); dir = dir.parent_path())
+        {
+            createdDirs.push_back(dir);
+        }
         std::filesystem::create_directories(packagePath);
 
-        //  Copy the package to the installation directory
+        // Install the package by staging it in a temporary file and atomically renaming it
+        // into place. If the package is currently mounted (loop device + dm-verity), the loop
+        // device keeps the old inode alive, so a running app keeps using the old image until it
+        // is unmounted, while future mounts pick up the new file. Overwriting the file in place
+        // (copy_file with overwrite_existing directly on the destination) would corrupt the
+        // live mount.
         auto destRalfPackagePath = packagePath / RalfPackage;
+        // Callers serialize Install calls, so a single deterministic staging name is safe:
+        // no other install can touch it while it is being written, synced or renamed. A file
+        // left here by a crashed install is removed by cleanupStaleStagingFiles() at startup.
+        auto tempRalfPackagePath = packagePath / (std::string(RalfPackage) + ".tmp");
         try
         {
-            std::filesystem::copy_file(fileLocator, destRalfPackagePath, std::filesystem::copy_options::overwrite_existing);
+            // Remove any pre-existing staging file first: a symlink planted at the
+            // deterministic staging path would otherwise be followed by copy_file, writing
+            // the package bytes to a target outside the installation tree. The tree is
+            // writable only by this service, so this is defense in depth.
+            std::error_code ec;
+            std::filesystem::remove(tempRalfPackagePath, ec);
+            std::filesystem::copy_file(fileLocator, tempRalfPackagePath, std::filesystem::copy_options::overwrite_existing);
+            if (std::filesystem::exists(destRalfPackagePath))
+            {
+                // Swapping an existing installation: keep the original file permissions
+                std::filesystem::permissions(tempRalfPackagePath, std::filesystem::status(destRalfPackagePath).permissions());
+            }
+            // The source was verified before the copy, but copy_file re-read it by pathname
+            // and it may have been replaced in between (TOCTOU). Verify the staged copy
+            // itself, so only bytes verified as staged can be renamed into place.
+            auto stagedPackage = openPackage(tempRalfPackagePath, true);
+            if (!stagedPackage || stagedPackage->id() != packageId || stagedPackage->version().toString() != version)
+            {
+                std::cerr << "[libPackage] Staged package verification failed for: " << tempRalfPackagePath << std::endl;
+                std::filesystem::remove(tempRalfPackagePath);
+                return Result::FAILED;
+            }
+            if (!syncFile(tempRalfPackagePath))
+            {
+                std::cerr << "[libPackage] Failed to sync package file to disk: " << tempRalfPackagePath << std::endl;
+                std::filesystem::remove(tempRalfPackagePath);
+                return Result::FAILED;
+            }
+            std::filesystem::rename(tempRalfPackagePath, destRalfPackagePath);
+            // The rename is the commit point: once it succeeds the new package is visible at
+            // the destination, so the install is a fact and the registration below matches
+            // the on-disk state. Crash analysis of this sequence (fsync data -> atomic rename
+            // -> fsync directory):
+            //   1. All fsyncs succeed: the new package is durable, period.
+            //   2. Crash before the fsyncs: the rename may or may not have reached the disk,
+            //      but since the file's data was fsynced BEFORE its name was moved into
+            //      place and the rename is atomic, the post-crash state is always either the
+            //      old package or the complete new package - never a torn package.ralf.
+            //   3. A directory fsync fails below: case 2 with unknown durability. The running
+            //      system still sees the new package, so in-memory registration matches disk;
+            //      after a power loss the boot-time rescan rebuilds registration from
+            //      whatever actually survived. Hence a failure here is logged as a warning,
+            //      not returned as FAILED - FAILED would misreport an install that did
+            //      happen and would itself create the "installed but unregistered" state.
+            if (!syncFile(packagePath))
+            {
+                std::cerr << "[libPackage] Warning: failed to sync package directory to disk: " << packagePath
+                          << " (package is installed but may not survive a crash)" << std::endl;
+            }
+            // Fsync the parents of any directories created above, so the new packageId/version
+            // directory entries themselves are durable; same post-commit warning-only treatment.
+            for (const auto &createdDir : createdDirs)
+            {
+                if (!syncFile(createdDir.parent_path()))
+                {
+                    std::cerr << "[libPackage] Warning: failed to sync directory to disk: " << createdDir.parent_path()
+                              << " (package is installed but may not survive a crash)" << std::endl;
+                }
+            }
+
             auto appPath = destRalfPackagePath.string();
             configMetadata.appPath = std::move(appPath);
             configMetadata.userId = mUserId;   // Ralf user id.
@@ -248,19 +425,45 @@ namespace packagemanager
             // Log error
             std::cerr
                 << "[libPackage] Error installing package: " << e.what() << std::endl;
+            std::error_code ec;
+            std::filesystem::remove(tempRalfPackagePath, ec);
             return Result::FAILED;
         }
         auto configKey = std::make_shared<ConfigMetadataKey>(std::make_pair(packageId, version));
 
         if (extractMetadataFromPackage(package.value(), configMetadata))
         {
-
             if (configMetadata.dial)
+            {   
+                // a re-installed package may have been registered before
+                // without its dial metadata
+                const auto isAlreadyDialRegistered = std::any_of(mDialPackages.begin(), mDialPackages.end(),
+                                                                 [&packageId, &version](const std::shared_ptr<ConfigMetadataKey> &entry)
+                                                                 { return entry->first == packageId && entry->second == version; });
+                if (!isAlreadyDialRegistered)
+                {
+                    mDialPackages.push_back(configKey);
+                }
+            }
+            else
             {
-                mDialPackages.push_back(configKey);
+                // a re-installed package may no longer carry dial metadata;
+                // drop any stale dial registration for it
+                mDialPackages.erase(std::remove_if(mDialPackages.begin(), mDialPackages.end(),
+                                                   [&packageId, &version](const std::shared_ptr<ConfigMetadataKey> &entry)
+                                                   { return entry->first == packageId && entry->second == version; }),
+                                    mDialPackages.end());
             }
         }
-        mInstalledPackages.push_back(configKey);
+
+        // On a re-install (file swap) of an already known package, do not register it twice
+        const auto isAlreadyRegistered = std::any_of(mInstalledPackages.begin(), mInstalledPackages.end(),
+                                                     [&packageId, &version](const std::shared_ptr<ConfigMetadataKey> &entry)
+                                                     { return entry->first == packageId && entry->second == version; });
+        if (!isAlreadyRegistered)
+        {
+            mInstalledPackages.push_back(configKey);
+        }
 
         return Result::SUCCESS;
     }
@@ -370,6 +573,13 @@ namespace packagemanager
             std::cerr << "[libPackage] RalfPackageImpl::Lock called before initialization." << std::endl;
             return Result::FAILED;
         }
+        // packageId/version are caller-supplied and used in filesystem paths below; reject
+        // anything that is not a path-safe key before touching the filesystem.
+        if (!isPathSafePackageKey(packageId, version))
+        {
+            std::cerr << "[libPackage] Invalid packageId/version: " << packageId << ", " << version << std::endl;
+            return Result::FAILED;
+        }
         // Step 1: Determine the package path
         auto packagePath = std::filesystem::path(AppInstallationPath) / packageId / version / RalfPackage;
         auto package = openPackage(packagePath);
@@ -378,12 +588,23 @@ namespace packagemanager
             std::cerr << "[libPackage] Failed to open package for locking: " << packagePath.string() << std::endl;
             return Result::FAILED;
         }
+        // The mount table is keyed by the embedded metadata (package.id() + "_" + version),
+        // while Unlock looks entries up by the caller's arguments. Reject a mismatch here so
+        // both sides always use the same canonical key; otherwise the mount would be stored
+        // under a key Unlock can never find, leaking it and its dependency counts.
+        if (package->id() != packageId || package->version().toString() != version)
+        {
+            std::cerr << "[libPackage] Package metadata mismatch: requested " << packageId << ", " << version
+                      << " but package contains " << package->id() << ", " << package->version().toString() << std::endl;
+            return Result::FAILED;
+        }
 
         std::vector<RalfPackageInfo> mountPkgList;
         auto status = lockPackage(package.value(), mountPkgList, configMetadata);
         if (status)
         {
-            // We need to dump this to a temp file and add it as par of configMetadata
+            // We need to dump this to a temp file and add it as par of configMetadata.
+            // packageId/version were already validated as a path-safe key at entry.
             auto tempFilePath = std::filesystem::temp_directory_path() / (packageId + "_" + version + "_metadata.json");
             if (serializeToJson(mountPkgList, tempFilePath))
             {
@@ -403,29 +624,55 @@ namespace packagemanager
             std::cerr << "[libPackage] RalfPackageImpl::Unlock called before initialization." << std::endl;
             return Result::FAILED;
         }
-        auto packagePath = std::filesystem::path(AppInstallationPath) / packageId / version / RalfPackage;
-        auto package = openPackage(packagePath);
-        if (!package)
-        {
-            std::cerr << "[libPackage] Failed to open package for unlocking: " << packagePath.string() << std::endl;
-            return Result::FAILED;
-        }
+        std::cout << "[libPackage] RalfPackageImpl::Unlock called with packageId: " << packageId << ", version: " << version << std::endl;
 
-        bool unmountResult = unmountDependentPackages(package.value());
-
-        // Clean up temporary metadata file created during Lock
-        auto tempFilePath = std::filesystem::temp_directory_path() / (packageId + "_" + version + "_metadata.json");
-        try
+        // The dependency tree resolved at Lock time is stored in mMountedPackages, so there is
+        // no need to re-open (and re-verify) the package file to release the lock.
+        auto key = std::make_pair(packageId, version);
+        if (mMountedPackages.find(key) == mMountedPackages.end())
         {
-            if (std::filesystem::exists(tempFilePath))
+            // After an upgrade swap the caller may present the version currently installed
+            // rather than the version that was actually locked. If exactly one version of
+            // this package is mounted, that entry is unambiguously the lock to release -
+            // its recorded dependency tree is the one that was locked.
+            const ConfigMetadataKey *mountedKey = nullptr;
+            int matches = 0;
+            for (const auto &entry : mMountedPackages)
             {
-                std::filesystem::remove(tempFilePath);
-                std::cout << "[libPackage] Removed temporary metadata file: " << tempFilePath << std::endl;
+                if (entry.first.first == packageId)
+                {
+                    mountedKey = &entry.first;
+                    ++matches;
+                }
+            }
+            if (matches == 1)
+            {
+                std::cout << "[libPackage] Requested version " << version << " of " << packageId
+                          << " is not mounted; unlocking the mounted version " << mountedKey->second << std::endl;
+                key = *mountedKey;
             }
         }
-        catch (const std::filesystem::filesystem_error &e)
+        bool unmountResult = unlockPackage(key);
+
+        // Clean up the temporary metadata file created during Lock, using the key that was
+        // actually locked (may differ from the caller's version after an upgrade swap).
+        // Only perform the cleanup for a path-safe key, so it can never remove a file
+        // outside the temp directory.
+        if (isPathSafePackageKey(key.first, key.second))
         {
-            std::cerr << "[libPackage] Error removing temporary metadata file " << tempFilePath << ": " << e.what() << std::endl;
+            const auto tempFilePath = std::filesystem::temp_directory_path() / (key.first + "_" + key.second + "_metadata.json");
+            try
+            {
+                if (std::filesystem::exists(tempFilePath))
+                {
+                    std::filesystem::remove(tempFilePath);
+                    std::cout << "[libPackage] Removed temporary metadata file: " << tempFilePath << std::endl;
+                }
+            }
+            catch (const std::filesystem::filesystem_error &e)
+            {
+                std::cerr << "[libPackage] Error removing temporary metadata file " << tempFilePath << ": " << e.what() << std::endl;
+            }
         }
 
         return unmountResult ? Result::SUCCESS : Result::FAILED;
@@ -496,7 +743,13 @@ namespace packagemanager
         auto version = package.version().toString();
         std::cout << "[libPackage] Locking packages." << packageId << ", version " << version << std::endl;
 
-        std::string pkgVerKey = packageId + "_" + version;
+        const ConfigMetadataKey pkgVerKey = std::make_pair(packageId, version);
+        // Directory name for the on-disk mount point only; the in-memory mount table uses
+        // the structured key above. The flat "<id>_<version>" name is unambiguous because
+        // version is guaranteed to contain no '_' (validated at Install via
+        // ralf::VersionNumber::fromString), so the last '_' is always the separator -
+        // the id may contain '_' freely.
+        const std::string pkgVerDirName = packageId + "_" + version;
 
         auto pkgMetadata = package.metaData();
         if (!pkgMetadata)
@@ -506,6 +759,9 @@ namespace packagemanager
         }
 
         status = true;
+        // Keys of the dependent packages locked by this call. Used for rollback on failure and
+        // stored in the mount table on success, so Unlock can release them without re-opening files.
+        std::vector<ConfigMetadataKey> lockedDependencies;
         // Let us process dependencies first
         auto dependencies = pkgMetadata->dependencies();
         for (const auto &dependency : dependencies)
@@ -536,10 +792,14 @@ namespace packagemanager
                 status = false;
                 break;
             }
+            lockedDependencies.push_back(std::make_pair(depPackage->id(), depPackage->version().toString()));
         }
         if (!status)
         {
-            unmountDependentPackages(package);
+            for (const auto &depKey : lockedDependencies)
+            {
+                unlockPackage(depKey);
+            }
             return false;
         }
         // Let us get permissions. from package.
@@ -568,11 +828,14 @@ namespace packagemanager
         if (!verifyResult)
         {
             std::cerr << "[libPackage] Failed to verify package: " << package.id() << " Error: " << verifyResult.error().what() << std::endl;
-            unmountDependentPackages(package);
+            for (const auto &depKey : lockedDependencies)
+            {
+                unlockPackage(depKey);
+            }
             return false;
         }
 
-        auto mountPath = std::filesystem::path(RDK_PACKAGE_MOUNT_PATH) / pkgVerKey / "rootfs";
+        auto mountPath = std::filesystem::path(RDK_PACKAGE_MOUNT_PATH) / pkgVerDirName / "rootfs";
         std::filesystem::create_directories(mountPath);
         std::cout << "[libPackage] Creating mount directory: " << mountPath << std::endl;
 
@@ -580,13 +843,26 @@ namespace packagemanager
         if (!mountResult)
         {
             std::cerr << "[libPackage][RALFMOUNT] Failed to mount dependent package: " << packageId << mountResult.error().what() << std::endl;
-            unmountDependentPackages(package);
+            for (const auto &depKey : lockedDependencies)
+            {
+                unlockPackage(depKey);
+            }
             return false;
         }
 
         std::unique_ptr<MountedPackageInfo> mountInfo = std::make_unique<MountedPackageInfo>();
+        mountInfo->dependencies = lockedDependencies;
 
-        auto configPath = std::filesystem::path(RDK_PACKAGE_MOUNT_PATH) / pkgVerKey / RDK_PACKAGE_CONFIG;
+        // Note: only the direct dependencies of this package are stored/printed here.
+        // Each dependency's own entry in the mount table holds its own direct dependencies,
+        // so the full tree is covered when walking recursively (e.g. in unlockPackage).
+        std::cout << "[libPackage] Mounted package: " << pkgVerDirName << " with " << lockedDependencies.size() << " resolved dependencies:" << std::endl;
+        for (const auto &depKey : lockedDependencies)
+        {
+            std::cout << "[libPackage]   -> " << depKey.first << "_" << depKey.second << std::endl;
+        }
+
+        auto configPath = std::filesystem::path(RDK_PACKAGE_MOUNT_PATH) / pkgVerDirName / RDK_PACKAGE_CONFIG;
         if (dumpPackageInfo(package, configPath))
         {
             mountInfo->pkgJsonPath = configPath.string();
@@ -649,55 +925,26 @@ namespace packagemanager
         return package;
     }
 
-    bool RalfPackageImpl::unmountDependentPackages(const ralf::Package &package)
+    bool RalfPackageImpl::unlockPackage(const ConfigMetadataKey &pkgVerKey)
     {
-        auto pkgMetadata = package.metaData();
-        if (!pkgMetadata)
-        {
-            std::cerr << "[libPackage] Failed to read package metadata for unlocking dependencies: " << pkgMetadata.error().what() << std::endl;
-            return false;
-        }
-
-        auto dependencies = pkgMetadata->dependencies();
-        for (const auto &dependency : dependencies)
-        {
-            std::string depPackageId = dependency.first;
-            ralf::VersionConstraint depPkgVersion = dependency.second;
-            std::string depInstalledVersion;
-
-            if (identifyDependencyVersion(depPackageId, depPkgVersion, depInstalledVersion))
-            {
-                auto fileLocator = std::filesystem::path(AppInstallationPath) / depPackageId / depInstalledVersion / RalfPackage;
-                auto depPackage = openPackage(fileLocator);
-                if (depPackage)
-                {
-                    if (!unmountDependentPackages(depPackage.value()))
-                    {
-                        std::cerr << "[libPackage] Failed to unmount dependent packages for package: " << depPackageId << ", version " << depInstalledVersion << std::endl;
-                        // TODO revisit this logic
-                        // return false;
-                    }
-                }
-            }
-            else
-            {
-                std::cerr << "[libPackage] Failed to idenitfy the version of dependency " << depPackageId << ", version " << depPkgVersion.toString() << std::endl;
-            }
-        }
-        std::string depPackageKey = package.id() + "_" + package.version().toString();
-
-        auto it = mMountedPackages.find(depPackageKey);
+        auto it = mMountedPackages.find(pkgVerKey);
         if (it == mMountedPackages.end())
         {
-            std::cerr << "[libPackage] Package not found in mounted packages: " << depPackageKey << std::endl;
+            std::cerr << "[libPackage] Package not found in mounted packages: " << pkgVerKey.first << "_" << pkgVerKey.second << std::endl;
             return false;
         }
 
-        if (it->second->packageMount->isMounted() == false)
+        bool status = true;
+        for (const auto &depKey : it->second->dependencies)
         {
-            std::cerr << "[libPackage] Package is not mounted: " << depPackageKey << std::endl;
-            return false;
+            if (!unlockPackage(depKey))
+            {
+                std::cerr << "[libPackage] Failed to unlock dependent package: " << depKey.first << "_" << depKey.second << std::endl;
+                // Keep unlocking the remaining dependencies even if one fails
+                status = false;
+            }
         }
+
         it->second->decMountCount();
         if (it->second->mountCount == 0)
         {
@@ -705,7 +952,7 @@ namespace packagemanager
             it->second->packageMount->unmount();
 
             // Clean up mount directories
-            auto mountBasePath = std::filesystem::path(RDK_PACKAGE_MOUNT_PATH) / depPackageKey;
+            auto mountBasePath = std::filesystem::path(RDK_PACKAGE_MOUNT_PATH) / (pkgVerKey.first + "_" + pkgVerKey.second);
             try
             {
                 if (std::filesystem::exists(mountBasePath))
@@ -722,7 +969,7 @@ namespace packagemanager
             mMountedPackages.erase(it);
         }
 
-        return true;
+        return status;
     }
 
     bool RalfPackageImpl::dumpPackageInfo(const ralf::Package &package, const std::filesystem::path &configPath)
