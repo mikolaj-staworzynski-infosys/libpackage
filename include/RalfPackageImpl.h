@@ -89,6 +89,17 @@ namespace packagemanager
         Result Unlock(const std::string &packageId, const std::string &version) override;
         Result GetFileMetadata(const std::string &fileLocator, std::string &packageId, std::string &version, ConfigMetaData &configMetadata) override;
 
+        /**
+         * Returns the ids of currently locked applications that must be restarted because they
+         * are the given package or depend on it, directly or transitively.
+         *
+         * The package is matched by id only, deliberately without a version: running instances
+         * are locked on the version that was installed at Lock time, which is typically older
+         * than the version just installed. Matching on the new version would find nothing,
+         * since that version is not mounted (locked) yet.
+         */
+        Result GetApplicationsToRestart(const std::string &packageId, std::vector<std::string> &applicationIds) override;
+
         Result GetInstalledPackageMetadata(const std::string &packageId, const std::string &version, std::string &config) override;
 
         Result GetConfigListForInstalledPackages(const std::string &filter, std::string &config) override;
@@ -163,6 +174,14 @@ namespace packagemanager
          * @return true if the package and all its dependents were unlocked successfully; false otherwise.
          */
         bool unlockPackage(const ConfigMetadataKey &pkgVerKey);
+
+        /**
+         * Builds the adjacency view (package key -> direct dependency keys) of a mount table
+         * for findApplicationsToRestart (see ApplicationsToRestart.h - the shared,
+         * PC-testable implementation this class delegates to).
+         */
+        static std::map<ConfigMetadataKey, std::vector<ConfigMetadataKey> > lockedDependencies(
+            const std::map<ConfigMetadataKey, std::unique_ptr<MountedPackageInfo> > &mountedPackages);
 
         /**
          * Identifies the installed version of a dependent package that satisfies the given version constraint.

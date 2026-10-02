@@ -19,7 +19,7 @@
 find_package(libralf REQUIRED)
 include(GNUInstallDirs)
 
-set (PACKAGE_SRCS RalfPackageHandler.cpp)
+set (PACKAGE_SRCS RalfPackageHandler.cpp ApplicationsToRestart.cpp)
 set (LIB_VER 2.0.1)
 add_library(Package SHARED ${PACKAGE_SRCS})
 if(DEFINED BUILD_VER)

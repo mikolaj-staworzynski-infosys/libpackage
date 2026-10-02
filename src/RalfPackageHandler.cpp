@@ -18,9 +18,11 @@
  */
 
 #include "RalfPackageImpl.h"
+#include "ApplicationsToRestart.h"
 #include <iostream>
 #include <filesystem>
 #include <algorithm>
+#include <set>
 #include <ralf/PackageMount.h>
 #include <ralf/PackageMetaData.h>
 #include <ralf/VersionNumber.h>
@@ -676,6 +678,32 @@ namespace packagemanager
         }
 
         return unmountResult ? Result::SUCCESS : Result::FAILED;
+    }
+
+    Result RalfPackageImpl::GetApplicationsToRestart(const std::string &packageId, std::vector<std::string> &applicationIds)
+    {
+        if (!mIsInitialized)
+        {
+            std::cerr << "[libPackage] RalfPackageImpl::GetApplicationsToRestart called before initialization." << std::endl;
+            return Result::FAILED;
+        }
+        findApplicationsToRestart(packageId, lockedDependencies(mMountedPackages), applicationIds);
+        std::cout << "[libPackage] GetApplicationsToRestart for packageId: " << packageId
+                  << " -> " << applicationIds.size() << " application(s) to restart" << std::endl;
+        return Result::SUCCESS;
+    }
+
+    // Builds the adjacency view (package key -> direct dependency keys) of the
+    // mount table that findApplicationsToRestart operates on.
+    std::map<ConfigMetadataKey, std::vector<ConfigMetadataKey> > RalfPackageImpl::lockedDependencies(
+        const std::map<ConfigMetadataKey, std::unique_ptr<MountedPackageInfo> > &mountedPackages)
+    {
+        std::map<ConfigMetadataKey, std::vector<ConfigMetadataKey> > adjacency;
+        for (const auto &entry : mountedPackages)
+        {
+            adjacency.emplace(entry.first, entry.second->dependencies);
+        }
+        return adjacency;
     }
 
     Result RalfPackageImpl::GetFileMetadata(const std::string &fileLocator, std::string &packageId, std::string &version, ConfigMetaData &configMetadata)
